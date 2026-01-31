@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Friday</title>
+<style>
+  :root {
+    --bg: #0f0f0f;
+    --surface: #1a1a2e;
+    --surface2: #16213e;
+    --accent: #e94560;
+    --accent2: #0f3460;
+    --text: #eee;
+    --text2: #999;
+    --green: #00d97e;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  header {
+    padding: 24px;
+    text-align: center;
+  }
+  header h1 { font-size: 1.5rem; font-weight: 600; }
+  header .subtitle { color: var(--text2); font-size: 0.85rem; margin-top: 4px; }
+
+  #status {
+    color: var(--text2);
+    font-size: 0.85rem;
+    min-height: 20px;
+    margin-bottom: 12px;
+    transition: color 0.2s;
+  }
+  #status.active { color: var(--green); }
+
+  #chat {
+    flex: 1;
+    width: 100%;
+    max-width: 640px;
+    overflow-y: auto;
+    padding: 0 16px 120px;
+  }
+  .msg {
+    margin: 8px 0;
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    max-width: 85%;
+    line-height: 1.5;
+    font-size: 0.95rem;
+    position: relative;
+  }
+  .msg.user {
+    background: var(--accent2);
+    margin-left: auto;
+    border-bottom-right-radius: 4px;
+  }
+  .msg.assistant {
+    background: var(--surface);
+    margin-right: auto;
+    border-bottom-left-radius: 4px;
+  }
+  .msg .meta {
+    font-size: 0.7rem;
+    color: var(--text2);
+    margin-top: 4px;
+  }
+
+  #controls {
+    position: fixed;
+    bottom: 0;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 16px;
+    padding: 20px;
+    background: linear-gradient(transparent, var(--bg) 30%);
+  }
+
+  .btn {
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .btn:hover { transform: scale(1.05); }
+  .btn:active { transform: scale(0.95); }
+
+  #micBtn {
+    background: var(--accent);
+    box-shadow: 0 0 0 0 rgba(233,69,96,0.4);
+  }
+  #micBtn.recording {
+    animation: pulse 1.5s infinite;
+    background: #ff2244;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(233,69,96,0.6); }
+    70% { box-shadow: 0 0 0 20px rgba(233,69,96,0); }
+    100% { box-shadow: 0 0 0 0 rgba(233,69,96,0); }
+  }
+
+  #clearBtn {
+    width: 48px; height: 48px;
+    background: var(--surface2);
+    color: var(--text2);
+    font-size: 16px;
+  }
+
+  .visualizer {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 40px;
+  }
+  .visualizer .bar {
+    width: 4px;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: height 0.05s;
+  }
+
+  @media (max-width: 480px) {
+    .msg { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Friday</h1>
+</header>
+
+<div id="status">Connecting...</div>
+<div id="chat"></div>
+
+<div id="controls">
+  <button class="btn" id="clearBtn" title="Clear conversation"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>
+  <button class="btn" id="micBtn" title="Hold to talk"><svg id="micIcon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+</div>
+
+<script>
+const SAMPLE_RATE = 16000;
+let ws, mediaStream, audioCtx, recorder, isRecording = false;
+const chatEl = document.getElementById('chat');
+const statusEl = document.getElementById('status');
+const micBtn = document.getElementById('micBtn');
+const clearBtn = document.getElementById('clearBtn');
+
+// ---- WebSocket ----
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => setStatus('Loading models... (first time may take a moment)');
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'ready') {
+      setStatus('Ready — hold the mic button to talk', true);
+    } else if (msg.type === 'status') {
+      setStatus(msg.text, true);
+    } else if (msg.type === 'transcript') {
+      addMessage(msg.role, msg.text, msg.time ? `${msg.time}s` : null);
+    } else if (msg.type === 'audio') {
+      playAudio(msg.data);
+      const t = msg.times;
+      setStatus(`STT ${t.stt}s · LLM ${t.llm}s · TTS ${t.tts}s`, true);
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('Disconnected. Reconnecting...');
+    setTimeout(connect, 2000);
+  };
+}
+
+// ---- Audio Recording ----
+async function startRecording() {
+  if (!mediaStream) {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  }
+
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+
+  const chunks = [];
+  proc.onaudioprocess = (e) => {
+    if (isRecording) {
+      const float32 = e.inputBuffer.getChannelData(0);
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
+      }
+      chunks.push(int16);
+    }
+  };
+
+  source.connect(proc);
+  proc.connect(audioCtx.destination);
+
+  isRecording = true;
+  recorder = { proc, source, chunks, audioCtx };
+  micBtn.classList.add('recording');
+  setStatus('Listening...', true);
+}
+
+function stopRecording() {
+  if (!recorder) return;
+  isRecording = false;
+  micBtn.classList.remove('recording');
+
+  const { proc, source, chunks, audioCtx: ctx } = recorder;
+  proc.disconnect();
+  source.disconnect();
+  ctx.close();
+
+  // Merge chunks
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const merged = new Int16Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  recorder = null;
+
+  // Skip if too short (< 0.3s)
+  if (merged.length < SAMPLE_RATE * 0.3) {
+    setStatus('Too short — hold longer', true);
+    return;
+  }
+
+  // Send as base64
+  const b64 = arrayBufferToBase64(merged.buffer);
+  ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+  setStatus('Processing...', true);
+}
+
+// ---- Audio Playback ----
+function playAudio(b64) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  audio.play();
+  audio.onended = () => URL.revokeObjectURL(url);
+}
+
+// ---- UI helpers ----
+function setStatus(text, active = false) {
+  statusEl.textContent = text;
+  statusEl.className = active ? 'active' : '';
+}
+
+function addMessage(role, text, meta) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.textContent = text;
+  if (meta) {
+    const m = document.createElement('div');
+    m.className = 'meta';
+    m.textContent = meta;
+    div.appendChild(m);
+  }
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+// ---- Event handlers ----
+// Support both click-toggle and hold-to-talk
+let holdTimer = null;
+let isHold = false;
+
+micBtn.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  isHold = false;
+  holdTimer = setTimeout(() => { isHold = true; }, 200);
+  startRecording();
+});
+
+micBtn.addEventListener('mouseup', (e) => {
+  e.preventDefault();
+  clearTimeout(holdTimer);
+  stopRecording();
+});
+
+micBtn.addEventListener('mouseleave', () => {
+  if (isRecording) stopRecording();
+  clearTimeout(holdTimer);
+});
+
+// Touch support
+micBtn.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  startRecording();
+});
+micBtn.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  stopRecording();
+});
+
+// Spacebar hold-to-talk
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !e.repeat && !isRecording) {
+    e.preventDefault();
+    startRecording();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' && isRecording) {
+    e.preventDefault();
+    stopRecording();
+  }
+});
+
+clearBtn.addEventListener('click', () => {
+  chatEl.innerHTML = '';
+  ws.send(JSON.stringify({ type: 'clear' }));
+});
+
+// ---- Init ----
+connect();
+</script>
+</body>
+</html>

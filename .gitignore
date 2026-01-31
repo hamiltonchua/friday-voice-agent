@@ -1,0 +1,17 @@
+# SSL certs
+cert.pem
+key.pem
+
+# Model files (too large for git)
+*.onnx
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# OS
+.DS_Store
