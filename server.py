@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Real-time voice chat server.
+Real-time voice chat server with streaming TTS.
 STT: faster-whisper (GPU)  |  LLM: OpenClaw (Friday)  |  TTS: Kokoro ONNX (local)
+
+v0.2: Streaming TTS — sentences are spoken as they arrive from the LLM.
 """
 
 import asyncio
@@ -9,10 +11,12 @@ import base64
 import io
 import json
 import os
+import re
 import tempfile
 import time
 import wave
 from pathlib import Path
+from typing import AsyncIterator
 
 import httpx
 import numpy as np
@@ -90,8 +94,18 @@ def transcribe(audio_bytes: bytes) -> str:
         os.unlink(tmp_path)
 
 
-def chat(user_text: str) -> str:
-    """Send user text to OpenClaw (Friday), get response."""
+# Sentence boundary pattern: ends with .!? followed by space or end
+SENTENCE_END_RE = re.compile(r'[.!?](?:\s|$)')
+
+
+async def chat_stream(user_text: str) -> AsyncIterator[tuple[str, str]]:
+    """
+    Stream chat response from OpenClaw.
+    Yields tuples of (event_type, data):
+      - ("token", token_text) for each token
+      - ("sentence", sentence_text) for each complete sentence
+      - ("done", full_text) when finished
+    """
     global conversation_history
 
     conversation_history.append({"role": "user", "content": user_text})
@@ -102,28 +116,72 @@ def chat(user_text: str) -> str:
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
 
-    response = httpx.post(
-        OPENCLAW_URL,
-        headers={
-            "Authorization": f"Bearer {OPENCLAW_TOKEN}",
-            "Content-Type": "application/json",
-            "x-openclaw-agent-id": OPENCLAW_AGENT,
-        },
-        json={
-            "model": "openclaw",
-            "messages": messages,
-            "user": "voice-chat",
-        },
-        timeout=60.0,
-    )
-    response.raise_for_status()
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            OPENCLAW_URL,
+            headers={
+                "Authorization": f"Bearer {OPENCLAW_TOKEN}",
+                "Content-Type": "application/json",
+                "x-openclaw-agent-id": OPENCLAW_AGENT,
+            },
+            json={
+                "model": "openclaw",
+                "messages": messages,
+                "user": "voice-chat",
+                "stream": True,
+            },
+            timeout=120.0,
+        ) as response:
+            response.raise_for_status()
 
-    data = response.json()
-    assistant_text = data["choices"][0]["message"]["content"]
+            full_text = ""
+            buffer = ""  # Accumulates text until we find a sentence boundary
 
-    conversation_history.append({"role": "assistant", "content": assistant_text})
-    print(f"[LLM] → \"{assistant_text[:80]}...\"" if len(assistant_text) > 80 else f"[LLM] → \"{assistant_text}\"")
-    return assistant_text
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+
+                data = line[6:]  # Strip "data: " prefix
+                if data == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content", "")
+
+                    if token:
+                        full_text += token
+                        buffer += token
+                        yield ("token", token)
+
+                        # Check for sentence boundaries in buffer
+                        while True:
+                            match = SENTENCE_END_RE.search(buffer)
+                            if not match:
+                                break
+
+                            # Found a sentence end
+                            end_pos = match.end()
+                            sentence = buffer[:end_pos].strip()
+                            buffer = buffer[end_pos:].lstrip()
+
+                            if sentence:
+                                yield ("sentence", sentence)
+
+                except json.JSONDecodeError:
+                    continue
+
+            # Emit any remaining text as final sentence
+            if buffer.strip():
+                yield ("sentence", buffer.strip())
+
+            # Record full response in history
+            conversation_history.append({"role": "assistant", "content": full_text})
+            print(f"[LLM] → \"{full_text[:80]}...\"" if len(full_text) > 80 else f"[LLM] → \"{full_text}\"")
+
+            yield ("done", full_text)
 
 
 def synthesize(text: str) -> bytes:
@@ -140,6 +198,7 @@ def synthesize(text: str) -> bytes:
         wf.writeframes(pcm.tobytes())
 
     return buf.getvalue()
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -180,25 +239,54 @@ async def websocket_endpoint(ws: WebSocket):
 
                 await ws.send_json({"type": "transcript", "role": "user", "text": user_text, "time": round(stt_time, 2)})
 
-                # 2. LLM (OpenClaw / Friday)
+                # 2. LLM streaming + TTS per sentence
                 await ws.send_json({"type": "status", "text": "Thinking..."})
-                t0 = time.time()
-                reply_text = await loop.run_in_executor(None, chat, user_text)
-                llm_time = time.time() - t0
-                await ws.send_json({"type": "transcript", "role": "assistant", "text": reply_text, "time": round(llm_time, 2)})
+                await ws.send_json({"type": "stream_start"})
 
-                # 3. TTS
-                await ws.send_json({"type": "status", "text": "Speaking..."})
-                t0 = time.time()
-                audio_out = await loop.run_in_executor(None, synthesize, reply_text)
-                tts_time = time.time() - t0
+                llm_start = time.time()
+                first_sentence_time = None
+                sentence_count = 0
+                total_tts_time = 0
 
-                audio_b64 = base64.b64encode(audio_out).decode()
-                await ws.send_json({
-                    "type": "audio",
-                    "data": audio_b64,
-                    "times": {"stt": round(stt_time, 2), "llm": round(llm_time, 2), "tts": round(tts_time, 2)},
-                })
+                async for event_type, data in chat_stream(user_text):
+                    if event_type == "token":
+                        # Send token for real-time transcript display
+                        await ws.send_json({"type": "token", "text": data})
+
+                    elif event_type == "sentence":
+                        if first_sentence_time is None:
+                            first_sentence_time = time.time() - llm_start
+
+                        # Generate TTS for this sentence
+                        await ws.send_json({"type": "status", "text": "Speaking..."})
+                        tts_start = time.time()
+                        audio_out = await loop.run_in_executor(None, synthesize, data)
+                        tts_time = time.time() - tts_start
+                        total_tts_time += tts_time
+
+                        audio_b64 = base64.b64encode(audio_out).decode()
+                        await ws.send_json({
+                            "type": "audio_chunk",
+                            "data": audio_b64,
+                            "sentence": data,
+                            "index": sentence_count,
+                        })
+                        sentence_count += 1
+                        print(f"[TTS] Sentence {sentence_count}: \"{data[:40]}...\" ({tts_time:.2f}s)" if len(data) > 40 else f"[TTS] Sentence {sentence_count}: \"{data}\" ({tts_time:.2f}s)")
+
+                    elif event_type == "done":
+                        llm_time = time.time() - llm_start
+                        await ws.send_json({
+                            "type": "stream_end",
+                            "text": data,
+                            "times": {
+                                "stt": round(stt_time, 2),
+                                "llm": round(llm_time, 2),
+                                "tts": round(total_tts_time, 2),
+                                "first_sentence": round(first_sentence_time, 2) if first_sentence_time else None,
+                            },
+                            "sentences": sentence_count,
+                        })
 
             elif msg["type"] == "clear":
                 conversation_history.clear()

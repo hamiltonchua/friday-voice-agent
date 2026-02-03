@@ -68,6 +68,21 @@
     margin-right: auto;
     border-bottom-left-radius: 4px;
   }
+  .msg.streaming {
+    background: var(--surface);
+    margin-right: auto;
+    border-bottom-left-radius: 4px;
+    border-left: 2px solid var(--accent);
+  }
+  .msg.streaming::after {
+    content: '▋';
+    animation: blink 1s infinite;
+    color: var(--accent);
+  }
+  @keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+  }
   .msg .meta {
     font-size: 0.7rem;
     color: var(--text2);
@@ -162,6 +177,47 @@ const statusEl = document.getElementById('status');
 const micBtn = document.getElementById('micBtn');
 const clearBtn = document.getElementById('clearBtn');
 
+// ---- Streaming state ----
+let streamingMsgEl = null;  // The element showing streaming text
+let streamingText = '';     // Accumulated streamed text
+
+// ---- Audio queue for sequential playback ----
+const audioQueue = [];
+let isPlaying = false;
+
+function enqueueAudio(b64) {
+  audioQueue.push(b64);
+  playNext();
+}
+
+function playNext() {
+  if (isPlaying || audioQueue.length === 0) return;
+
+  isPlaying = true;
+  const b64 = audioQueue.shift();
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+
+  audio.onended = () => {
+    URL.revokeObjectURL(url);
+    isPlaying = false;
+    playNext();
+  };
+
+  audio.onerror = () => {
+    URL.revokeObjectURL(url);
+    isPlaying = false;
+    playNext();
+  };
+
+  audio.play().catch(() => {
+    isPlaying = false;
+    playNext();
+  });
+}
+
 // ---- WebSocket ----
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -177,8 +233,49 @@ function connect() {
     } else if (msg.type === 'status') {
       setStatus(msg.text, true);
     } else if (msg.type === 'transcript') {
+      // User transcript (non-streaming)
       addMessage(msg.role, msg.text, msg.time ? `${msg.time}s` : null);
+    } else if (msg.type === 'stream_start') {
+      // Start streaming assistant response
+      streamingText = '';
+      streamingMsgEl = document.createElement('div');
+      streamingMsgEl.className = 'msg assistant streaming';
+      chatEl.appendChild(streamingMsgEl);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    } else if (msg.type === 'token') {
+      // Append token to streaming message
+      streamingText += msg.text;
+      if (streamingMsgEl) {
+        streamingMsgEl.textContent = streamingText;
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+    } else if (msg.type === 'audio_chunk') {
+      // Queue audio chunk for playback
+      enqueueAudio(msg.data);
+    } else if (msg.type === 'stream_end') {
+      // Finalize streaming message
+      if (streamingMsgEl) {
+        streamingMsgEl.classList.remove('streaming');
+        streamingMsgEl.textContent = msg.text;
+
+        // Add timing meta
+        const t = msg.times;
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        const parts = [`STT ${t.stt}s`, `LLM ${t.llm}s`, `TTS ${t.tts}s`];
+        if (t.first_sentence) {
+          parts.push(`first audio ${t.first_sentence}s`);
+        }
+        meta.textContent = parts.join(' · ');
+        streamingMsgEl.appendChild(meta);
+
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+      streamingMsgEl = null;
+      streamingText = '';
+      setStatus(`${msg.sentences} sentences streamed`, true);
     } else if (msg.type === 'audio') {
+      // Legacy: full audio (fallback, shouldn't happen in v0.2)
       playAudio(msg.data);
       const t = msg.times;
       setStatus(`STT ${t.stt}s · LLM ${t.llm}s · TTS ${t.tts}s`, true);
@@ -257,7 +354,7 @@ function stopRecording() {
   setStatus('Processing...', true);
 }
 
-// ---- Audio Playback ----
+// ---- Audio Playback (legacy, for backwards compat) ----
 function playAudio(b64) {
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   const blob = new Blob([bytes], { type: 'audio/wav' });
@@ -343,6 +440,8 @@ document.addEventListener('keyup', (e) => {
 
 clearBtn.addEventListener('click', () => {
   chatEl.innerHTML = '';
+  // Clear audio queue
+  audioQueue.length = 0;
   ws.send(JSON.stringify({ type: 'clear' }));
 });
 
