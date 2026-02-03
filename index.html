@@ -31,7 +31,6 @@
     text-align: center;
   }
   header h1 { font-size: 1.5rem; font-weight: 600; }
-  header .subtitle { color: var(--text2); font-size: 0.85rem; margin-top: 4px; }
 
   #status {
     color: var(--text2);
@@ -70,15 +69,21 @@
     border-bottom-left-radius: 4px;
   }
   .msg.streaming {
-    background: var(--surface);
-    margin-right: auto;
-    border-bottom-left-radius: 4px;
     border-left: 2px solid var(--accent);
   }
   .msg.streaming::after {
     content: '▋';
     animation: blink 1s infinite;
     color: var(--accent);
+  }
+  .msg.interrupted {
+    opacity: 0.6;
+    border-left: 2px solid var(--text2);
+  }
+  .msg.interrupted::after {
+    content: ' [interrupted]';
+    color: var(--text2);
+    font-size: 0.75rem;
   }
   @keyframes blink {
     0%, 50% { opacity: 1; }
@@ -203,7 +208,8 @@ const vadToggle = document.getElementById('vadToggle');
 // ---- State ----
 let vadEnabled = false;
 let vadInstance = null;
-let isProcessing = false;  // Are we waiting for a response?
+let isProcessing = false;  // Waiting for LLM response
+let isSpeaking = false;    // Audio is playing
 
 // ---- Streaming state ----
 let streamingMsgEl = null;
@@ -211,7 +217,7 @@ let streamingText = '';
 
 // ---- Audio queue for sequential playback ----
 const audioQueue = [];
-let isPlaying = false;
+let currentAudio = null;
 
 function enqueueAudio(b64) {
   audioQueue.push(b64);
@@ -219,31 +225,74 @@ function enqueueAudio(b64) {
 }
 
 function playNext() {
-  if (isPlaying || audioQueue.length === 0) return;
+  if (currentAudio || audioQueue.length === 0) return;
 
-  isPlaying = true;
+  isSpeaking = true;
   const b64 = audioQueue.shift();
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   const blob = new Blob([bytes], { type: 'audio/wav' });
   const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
+  currentAudio = new Audio(url);
 
-  audio.onended = () => {
+  currentAudio.onended = () => {
     URL.revokeObjectURL(url);
-    isPlaying = false;
+    currentAudio = null;
+    if (audioQueue.length === 0) {
+      isSpeaking = false;
+    }
     playNext();
   };
 
-  audio.onerror = () => {
+  currentAudio.onerror = () => {
     URL.revokeObjectURL(url);
-    isPlaying = false;
+    currentAudio = null;
+    if (audioQueue.length === 0) {
+      isSpeaking = false;
+    }
     playNext();
   };
 
-  audio.play().catch(() => {
-    isPlaying = false;
+  currentAudio.play().catch(() => {
+    currentAudio = null;
+    if (audioQueue.length === 0) {
+      isSpeaking = false;
+    }
     playNext();
   });
+}
+
+function stopPlayback() {
+  // Stop current audio
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+    currentAudio = null;
+  }
+  // Clear queue
+  audioQueue.length = 0;
+  isSpeaking = false;
+}
+
+function interrupt() {
+  console.log('[Interrupt] User interrupted');
+  
+  // Stop audio playback
+  stopPlayback();
+  
+  // Mark current streaming message as interrupted
+  if (streamingMsgEl) {
+    streamingMsgEl.classList.remove('streaming');
+    streamingMsgEl.classList.add('interrupted');
+    streamingMsgEl = null;
+    streamingText = '';
+  }
+  
+  // Tell server to cancel
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'cancel' }));
+  }
+  
+  isProcessing = false;
 }
 
 // ---- WebSocket ----
@@ -296,7 +345,12 @@ function connect() {
       streamingText = '';
       isProcessing = false;
       updateStatusForMode();
+    } else if (msg.type === 'cancelled') {
+      console.log('[WS] Server confirmed cancel');
+      isProcessing = false;
+      updateStatusForMode();
     } else if (msg.type === 'audio') {
+      // Legacy single audio
       playAudio(msg.data);
       const t = msg.times;
       setStatus(`STT ${t.stt}s · LLM ${t.llm}s · TTS ${t.tts}s`, 'active');
@@ -324,16 +378,18 @@ async function initVAD() {
       preSpeechPadFrames: 10,
       redemptionFrames: 15,
       onSpeechStart: () => {
-        if (!isProcessing) {
-          micBtn.classList.add('recording');
-          setStatus('Listening...', 'listening');
+        // If Friday is speaking or processing, interrupt
+        if (isSpeaking || isProcessing) {
+          interrupt();
         }
+        micBtn.classList.add('recording');
+        setStatus('Listening...', 'listening');
       },
       onSpeechEnd: (audio) => {
         micBtn.classList.remove('recording');
-        if (!isProcessing && audio.length > SAMPLE_RATE * 0.3) {
+        if (audio.length > SAMPLE_RATE * 0.3) {
           sendAudio(audio);
-        } else if (!isProcessing) {
+        } else {
           updateStatusForMode();
         }
       },
@@ -381,7 +437,6 @@ function toggleVAD() {
 
 // ---- Send audio to server ----
 function sendAudio(float32Audio) {
-  // Convert float32 to int16
   const int16 = new Int16Array(float32Audio.length);
   for (let i = 0; i < float32Audio.length; i++) {
     int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32Audio[i] * 32767)));
@@ -400,7 +455,12 @@ let manualStream = null;
 let manualCtx = null;
 
 async function startManualRecording() {
-  if (vadEnabled) return; // VAD handles it
+  if (vadEnabled) return;
+
+  // Interrupt if speaking
+  if (isSpeaking || isProcessing) {
+    interrupt();
+  }
 
   if (!manualStream) {
     manualStream = await navigator.mediaDevices.getUserMedia({
@@ -437,7 +497,6 @@ function stopManualRecording() {
   manualCtx.close();
   manualRecorder = null;
 
-  // Merge chunks
   const total = manualChunks.reduce((n, c) => n + c.length, 0);
   const merged = new Float32Array(total);
   let offset = 0;
@@ -455,7 +514,7 @@ function stopManualRecording() {
   sendAudio(merged);
 }
 
-// ---- Audio Playback ----
+// ---- Audio Playback (legacy) ----
 function playAudio(b64) {
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   const blob = new Blob([bytes], { type: 'audio/wav' });
@@ -513,7 +572,6 @@ micBtn.addEventListener('mouseleave', () => {
   if (manualRecorder) stopManualRecording();
 });
 
-// Touch support
 micBtn.addEventListener('touchstart', (e) => {
   e.preventDefault();
   startManualRecording();
@@ -523,7 +581,6 @@ micBtn.addEventListener('touchend', (e) => {
   stopManualRecording();
 });
 
-// Spacebar hold-to-talk (only when VAD is off)
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && !e.repeat && !vadEnabled && !manualRecorder) {
     e.preventDefault();
@@ -537,13 +594,11 @@ document.addEventListener('keyup', (e) => {
   }
 });
 
-// VAD toggle
 vadToggle.addEventListener('click', toggleVAD);
 
-// Clear
 clearBtn.addEventListener('click', () => {
   chatEl.innerHTML = '';
-  audioQueue.length = 0;
+  stopPlayback();
   ws.send(JSON.stringify({ type: 'clear' }));
 });
 

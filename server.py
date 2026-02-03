@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Real-time voice chat server with streaming TTS.
+Real-time voice chat server with streaming TTS and interruption support.
 STT: faster-whisper (GPU)  |  LLM: OpenClaw (Friday)  |  TTS: Kokoro ONNX (local)
 
-v0.2: Streaming TTS — sentences are spoken as they arrive from the LLM.
+v0.3: Streaming TTS + VAD + Interruption support
 """
 
 import asyncio
@@ -98,13 +98,14 @@ def transcribe(audio_bytes: bytes) -> str:
 SENTENCE_END_RE = re.compile(r'[.!?](?:\s|$)')
 
 
-async def chat_stream(user_text: str) -> AsyncIterator[tuple[str, str]]:
+async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncIterator[tuple[str, str]]:
     """
     Stream chat response from OpenClaw.
     Yields tuples of (event_type, data):
       - ("token", token_text) for each token
       - ("sentence", sentence_text) for each complete sentence
       - ("done", full_text) when finished
+      - ("cancelled", partial_text) when interrupted
     """
     global conversation_history
 
@@ -116,72 +117,88 @@ async def chat_stream(user_text: str) -> AsyncIterator[tuple[str, str]]:
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
 
-    async with httpx.AsyncClient() as client:
-        async with client.stream(
-            "POST",
-            OPENCLAW_URL,
-            headers={
-                "Authorization": f"Bearer {OPENCLAW_TOKEN}",
-                "Content-Type": "application/json",
-                "x-openclaw-agent-id": OPENCLAW_AGENT,
-            },
-            json={
-                "model": "openclaw",
-                "messages": messages,
-                "user": "voice-chat",
-                "stream": True,
-            },
-            timeout=120.0,
-        ) as response:
-            response.raise_for_status()
+    full_text = ""
+    buffer = ""
+    cancelled = False
 
-            full_text = ""
-            buffer = ""  # Accumulates text until we find a sentence boundary
+    try:
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                OPENCLAW_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENCLAW_TOKEN}",
+                    "Content-Type": "application/json",
+                    "x-openclaw-agent-id": OPENCLAW_AGENT,
+                },
+                json={
+                    "model": "openclaw",
+                    "messages": messages,
+                    "user": "voice-chat",
+                    "stream": True,
+                },
+                timeout=120.0,
+            ) as response:
+                response.raise_for_status()
 
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
+                async for line in response.aiter_lines():
+                    # Check for cancellation
+                    if cancel_event.is_set():
+                        cancelled = True
+                        print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
+                        break
 
-                data = line[6:]  # Strip "data: " prefix
-                if data == "[DONE]":
-                    break
+                    if not line.startswith("data: "):
+                        continue
 
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    token = delta.get("content", "")
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
 
-                    if token:
-                        full_text += token
-                        buffer += token
-                        yield ("token", token)
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
 
-                        # Check for sentence boundaries in buffer
-                        while True:
-                            match = SENTENCE_END_RE.search(buffer)
-                            if not match:
-                                break
+                        if token:
+                            full_text += token
+                            buffer += token
+                            yield ("token", token)
 
-                            # Found a sentence end
-                            end_pos = match.end()
-                            sentence = buffer[:end_pos].strip()
-                            buffer = buffer[end_pos:].lstrip()
+                            # Check for sentence boundaries
+                            while True:
+                                match = SENTENCE_END_RE.search(buffer)
+                                if not match:
+                                    break
 
-                            if sentence:
-                                yield ("sentence", sentence)
+                                end_pos = match.end()
+                                sentence = buffer[:end_pos].strip()
+                                buffer = buffer[end_pos:].lstrip()
 
-                except json.JSONDecodeError:
-                    continue
+                                if sentence:
+                                    yield ("sentence", sentence)
 
-            # Emit any remaining text as final sentence
-            if buffer.strip():
-                yield ("sentence", buffer.strip())
+                    except json.JSONDecodeError:
+                        continue
 
-            # Record full response in history
-            conversation_history.append({"role": "assistant", "content": full_text})
-            print(f"[LLM] → \"{full_text[:80]}...\"" if len(full_text) > 80 else f"[LLM] → \"{full_text}\"")
+    except httpx.HTTPError as e:
+        print(f"[LLM] HTTP error: {e}")
+        cancelled = True
 
-            yield ("done", full_text)
+    if cancelled:
+        # Don't add incomplete response to history, remove user message too
+        if conversation_history and conversation_history[-1]["role"] == "user":
+            conversation_history.pop()
+        yield ("cancelled", full_text)
+    else:
+        # Emit remaining text
+        if buffer.strip():
+            yield ("sentence", buffer.strip())
+
+        # Record full response
+        conversation_history.append({"role": "assistant", "content": full_text})
+        print(f"[LLM] → \"{full_text[:80]}...\"" if len(full_text) > 80 else f"[LLM] → \"{full_text}\"")
+        yield ("done", full_text)
 
 
 def synthesize(text: str) -> bytes:
@@ -220,79 +237,123 @@ async def websocket_endpoint(ws: WebSocket):
     await loop.run_in_executor(None, get_kokoro)
     await ws.send_json({"type": "ready"})
 
+    # Cancellation event for current processing
+    cancel_event = asyncio.Event()
+    processing_task = None
+
+    async def process_audio(audio_bytes: bytes):
+        nonlocal cancel_event
+        cancel_event.clear()
+
+        # 1. STT
+        await ws.send_json({"type": "status", "text": "Transcribing..."})
+        t0 = time.time()
+        user_text = await loop.run_in_executor(None, transcribe, audio_bytes)
+        stt_time = time.time() - t0
+
+        if cancel_event.is_set():
+            return
+
+        if not user_text:
+            await ws.send_json({"type": "status", "text": "Didn't catch that. Try again?"})
+            return
+
+        await ws.send_json({"type": "transcript", "role": "user", "text": user_text, "time": round(stt_time, 2)})
+
+        if cancel_event.is_set():
+            return
+
+        # 2. LLM streaming + TTS per sentence
+        await ws.send_json({"type": "status", "text": "Thinking..."})
+        await ws.send_json({"type": "stream_start"})
+
+        llm_start = time.time()
+        first_sentence_time = None
+        sentence_count = 0
+        total_tts_time = 0
+
+        async for event_type, data in chat_stream(user_text, cancel_event):
+            if cancel_event.is_set() and event_type not in ("cancelled", "done"):
+                continue
+
+            if event_type == "token":
+                await ws.send_json({"type": "token", "text": data})
+
+            elif event_type == "sentence":
+                if first_sentence_time is None:
+                    first_sentence_time = time.time() - llm_start
+
+                # Check cancellation before TTS
+                if cancel_event.is_set():
+                    continue
+
+                await ws.send_json({"type": "status", "text": "Speaking..."})
+                tts_start = time.time()
+                audio_out = await loop.run_in_executor(None, synthesize, data)
+                tts_time = time.time() - tts_start
+                total_tts_time += tts_time
+
+                # Check cancellation after TTS
+                if cancel_event.is_set():
+                    continue
+
+                audio_b64 = base64.b64encode(audio_out).decode()
+                await ws.send_json({
+                    "type": "audio_chunk",
+                    "data": audio_b64,
+                    "sentence": data,
+                    "index": sentence_count,
+                })
+                sentence_count += 1
+                print(f"[TTS] Sentence {sentence_count}: \"{data[:40]}...\" ({tts_time:.2f}s)" if len(data) > 40 else f"[TTS] Sentence {sentence_count}: \"{data}\" ({tts_time:.2f}s)")
+
+            elif event_type == "cancelled":
+                print(f"[WS] Response cancelled")
+                await ws.send_json({"type": "cancelled"})
+                return
+
+            elif event_type == "done":
+                llm_time = time.time() - llm_start
+                await ws.send_json({
+                    "type": "stream_end",
+                    "text": data,
+                    "times": {
+                        "stt": round(stt_time, 2),
+                        "llm": round(llm_time, 2),
+                        "tts": round(total_tts_time, 2),
+                        "first_sentence": round(first_sentence_time, 2) if first_sentence_time else None,
+                    },
+                    "sentences": sentence_count,
+                })
+
     try:
         while True:
             msg = await ws.receive_json()
 
             if msg["type"] == "audio":
+                # Cancel any existing processing
+                if processing_task and not processing_task.done():
+                    cancel_event.set()
+                    try:
+                        await asyncio.wait_for(processing_task, timeout=2.0)
+                    except asyncio.TimeoutError:
+                        processing_task.cancel()
+
                 audio_bytes = base64.b64decode(msg["data"])
+                processing_task = asyncio.create_task(process_audio(audio_bytes))
 
-                # 1. STT
-                await ws.send_json({"type": "status", "text": "Transcribing..."})
-                t0 = time.time()
-                user_text = await loop.run_in_executor(None, transcribe, audio_bytes)
-                stt_time = time.time() - t0
-
-                if not user_text:
-                    await ws.send_json({"type": "status", "text": "Didn't catch that. Try again?"})
-                    continue
-
-                await ws.send_json({"type": "transcript", "role": "user", "text": user_text, "time": round(stt_time, 2)})
-
-                # 2. LLM streaming + TTS per sentence
-                await ws.send_json({"type": "status", "text": "Thinking..."})
-                await ws.send_json({"type": "stream_start"})
-
-                llm_start = time.time()
-                first_sentence_time = None
-                sentence_count = 0
-                total_tts_time = 0
-
-                async for event_type, data in chat_stream(user_text):
-                    if event_type == "token":
-                        # Send token for real-time transcript display
-                        await ws.send_json({"type": "token", "text": data})
-
-                    elif event_type == "sentence":
-                        if first_sentence_time is None:
-                            first_sentence_time = time.time() - llm_start
-
-                        # Generate TTS for this sentence
-                        await ws.send_json({"type": "status", "text": "Speaking..."})
-                        tts_start = time.time()
-                        audio_out = await loop.run_in_executor(None, synthesize, data)
-                        tts_time = time.time() - tts_start
-                        total_tts_time += tts_time
-
-                        audio_b64 = base64.b64encode(audio_out).decode()
-                        await ws.send_json({
-                            "type": "audio_chunk",
-                            "data": audio_b64,
-                            "sentence": data,
-                            "index": sentence_count,
-                        })
-                        sentence_count += 1
-                        print(f"[TTS] Sentence {sentence_count}: \"{data[:40]}...\" ({tts_time:.2f}s)" if len(data) > 40 else f"[TTS] Sentence {sentence_count}: \"{data}\" ({tts_time:.2f}s)")
-
-                    elif event_type == "done":
-                        llm_time = time.time() - llm_start
-                        await ws.send_json({
-                            "type": "stream_end",
-                            "text": data,
-                            "times": {
-                                "stt": round(stt_time, 2),
-                                "llm": round(llm_time, 2),
-                                "tts": round(total_tts_time, 2),
-                                "first_sentence": round(first_sentence_time, 2) if first_sentence_time else None,
-                            },
-                            "sentences": sentence_count,
-                        })
+            elif msg["type"] == "cancel":
+                print("[WS] Cancel requested")
+                cancel_event.set()
+                await ws.send_json({"type": "cancelled"})
 
             elif msg["type"] == "clear":
+                cancel_event.set()
                 conversation_history.clear()
                 await ws.send_json({"type": "status", "text": "Conversation cleared."})
 
     except WebSocketDisconnect:
+        cancel_event.set()
         print("[WS] Client disconnected")
 
 # ---------------------------------------------------------------------------
