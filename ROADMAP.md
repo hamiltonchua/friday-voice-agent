@@ -12,54 +12,48 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 
 ---
 
-## Phase 1: Streaming TTS (v0.2)
+## Phase 1: Streaming TTS (v0.2) ✅
 *Biggest perceived latency improvement for least effort.*
 
-- [ ] Split LLM response into sentences as they arrive
-- [ ] Generate TTS per sentence and send each chunk to the client immediately
-- [ ] Client plays audio chunks sequentially (queue-based)
-- [ ] Switch OpenClaw API call to streaming (`stream: true` SSE)
-- [ ] Accumulate streamed text, detect sentence boundaries, fire TTS per sentence
-- [ ] Show transcript updating in real-time as tokens arrive
+- [x] Split LLM response into sentences as they arrive
+- [x] Generate TTS per sentence and send each chunk to the client immediately
+- [x] Client plays audio chunks sequentially (queue-based)
+- [x] Switch OpenClaw API call to streaming (`stream: true` SSE)
+- [x] Accumulate streamed text, detect sentence boundaries, fire TTS per sentence
+- [x] Show transcript updating in real-time as tokens arrive
 
-**Estimated effort:** Half a day
-**Branch:** `feat/streaming-tts`
+**Completed:** 2026-02-03
 
 ---
 
-## Phase 2: Voice Activity Detection — No More Button (v0.3)
+## Phase 2: Voice Activity Detection — No More Button (v0.3) ✅
 *Remove push-to-talk. System listens continuously and detects speech automatically.*
 
-- [ ] Add VAD to the frontend (silero-vad has a JS/WASM port, or use `@ricky0123/vad-web`)
-- [ ] Auto-start recording when speech detected
-- [ ] Auto-stop and send to STT when silence detected (configurable threshold, ~500ms)
-- [ ] Visual indicator: idle → listening → processing → speaking
-- [ ] Keep the mic button as a manual fallback
-- [ ] Handle edge cases: background noise, false triggers, short utterances
+- [x] Add VAD to the frontend (@ricky0123/vad-web — Silero VAD in browser)
+- [x] Auto-start recording when speech detected
+- [x] Auto-stop and send to STT when silence detected
+- [x] Visual indicator: idle → listening → processing → speaking
+- [x] Keep the mic button as a manual fallback
+- [x] Toggle button to enable/disable VAD mode
 
-**Estimated effort:** 1 day
-**Branch:** `feat/vad`
+**Completed:** 2026-02-03
 
 ---
 
-## Phase 3: Interruption Support (v0.4)
+## Phase 3: Interruption Support (v0.4) ✅
 *If you talk while Friday is speaking, she stops and listens.*
 
-- [ ] Track playback state on the client (playing / idle)
-- [ ] Keep VAD active during TTS playback
-- [ ] On speech detected during playback:
+- [x] Track playback state on the client (playing / idle)
+- [x] Keep VAD active during TTS playback
+- [x] On speech detected during playback:
   - Stop current audio immediately
   - Cancel any queued TTS chunks
   - Send cancel signal to server (abort in-flight LLM/TTS)
   - Capture new speech and send to STT
-- [ ] Server-side: handle cancel gracefully (abort streaming LLM call)
-- [ ] Test echo cancellation — ensure TTS output doesn't trigger VAD
-  - Browser `echoCancellation: true` should handle most cases
-  - May need gain/threshold tuning
+- [x] Server-side: handle cancel gracefully (abort streaming LLM call)
+- [x] Interrupted messages shown with visual indicator
 
-**Estimated effort:** 1 day
-**Branch:** `feat/interruption`
-**Depends on:** Phase 2 (VAD)
+**Completed:** 2026-02-03
 
 ---
 
