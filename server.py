@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Real-time voice chat server with streaming TTS and interruption support.
-STT: faster-whisper (GPU)  |  LLM: OpenClaw (Friday)  |  TTS: Kokoro ONNX (local)
+Kismet Voice Agent - Real-time voice chat with streaming TTS and interruption support.
+STT: faster-whisper (GPU)  |  LLM: OpenClaw  |  TTS: Chatterbox Turbo (GPU)
 
-v0.3: Streaming TTS + VAD + Interruption support
+v0.4: Chatterbox TTS integration
 """
 
 import asyncio
@@ -30,8 +30,10 @@ from fastapi.responses import HTMLResponse
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "float16")
+TTS_ENGINE = os.getenv("TTS_ENGINE", "chatterbox")  # "chatterbox" or "kokoro"
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
-SAMPLE_RATE = 16000
+CHATTERBOX_REF = os.getenv("CHATTERBOX_REF", None)  # Optional reference audio for voice cloning
+STT_SAMPLE_RATE = 16000
 
 # OpenClaw gateway
 OPENCLAW_URL = os.getenv("OPENCLAW_URL", "http://127.0.0.1:18789/v1/chat/completions")
@@ -49,7 +51,8 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
 # Global singletons
 # ---------------------------------------------------------------------------
 whisper_model = None
-kokoro_tts = None
+tts_model = None
+tts_sample_rate = None
 conversation_history = []
 
 def get_whisper():
@@ -61,14 +64,24 @@ def get_whisper():
         print("[STT] Ready.")
     return whisper_model
 
-def get_kokoro():
-    global kokoro_tts
-    if kokoro_tts is None:
-        import kokoro_onnx
-        print("[TTS] Loading Kokoro...")
-        kokoro_tts = kokoro_onnx.Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-        print(f"[TTS] Ready. Voice: {KOKORO_VOICE}")
-    return kokoro_tts
+def get_tts():
+    global tts_model, tts_sample_rate
+    if tts_model is None:
+        if TTS_ENGINE == "chatterbox":
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            print("[TTS] Loading Chatterbox Turbo...")
+            tts_model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+            tts_sample_rate = tts_model.sr
+            print(f"[TTS] Chatterbox ready. Sample rate: {tts_sample_rate}Hz")
+            if CHATTERBOX_REF:
+                print(f"[TTS] Using reference voice: {CHATTERBOX_REF}")
+        else:
+            import kokoro_onnx
+            print("[TTS] Loading Kokoro...")
+            tts_model = kokoro_onnx.Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+            tts_sample_rate = 22050  # Kokoro sample rate
+            print(f"[TTS] Kokoro ready. Voice: {KOKORO_VOICE}")
+    return tts_model, tts_sample_rate
 
 # ---------------------------------------------------------------------------
 # Pipeline functions
@@ -82,7 +95,7 @@ def transcribe(audio_bytes: bytes) -> str:
         with wave.open(f, "w") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
+            wf.setframerate(STT_SAMPLE_RATE)
             wf.writeframes(audio_bytes)
 
     try:
@@ -201,20 +214,36 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
         yield ("done", full_text)
 
 
-def synthesize(text: str) -> bytes:
-    """Convert text to speech, return WAV bytes."""
-    tts = get_kokoro()
-    samples, sr = tts.create(text, voice=KOKORO_VOICE, speed=1.0)
+def synthesize(text: str) -> tuple[bytes, int]:
+    """Convert text to speech, return (WAV bytes, sample_rate)."""
+    model, sr = get_tts()
 
+    if TTS_ENGINE == "chatterbox":
+        import torch
+        # Chatterbox Turbo
+        wav_tensor = model.generate(
+            text,
+            audio_prompt_path=CHATTERBOX_REF,
+            exaggeration=0.0,
+            cfg_weight=0.0,
+        )
+        # wav_tensor is (1, samples) float32 tensor
+        samples = wav_tensor.squeeze(0).cpu().numpy()
+    else:
+        # Kokoro
+        samples, sr = model.create(text, voice=KOKORO_VOICE, speed=1.0)
+
+    # Convert to WAV bytes
     buf = io.BytesIO()
     with wave.open(buf, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sr)
+        # Convert float32 to int16
         pcm = (samples * 32767).astype(np.int16)
         wf.writeframes(pcm.tobytes())
 
-    return buf.getvalue()
+    return buf.getvalue(), sr
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +263,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_whisper)
-    await loop.run_in_executor(None, get_kokoro)
+    await loop.run_in_executor(None, get_tts)
     await ws.send_json({"type": "ready"})
 
     # Cancellation event for current processing
@@ -289,7 +318,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                 await ws.send_json({"type": "status", "text": "Speaking..."})
                 tts_start = time.time()
-                audio_out = await loop.run_in_executor(None, synthesize, data)
+                audio_out, sr = await loop.run_in_executor(None, synthesize, data)
                 tts_time = time.time() - tts_start
                 total_tts_time += tts_time
 
@@ -372,4 +401,5 @@ if __name__ == "__main__":
         print(f"[SSL] HTTPS enabled")
 
     print(f"[LLM] OpenClaw endpoint: {OPENCLAW_URL}")
+    print(f"[TTS] Engine: {TTS_ENGINE}")
     uvicorn.run(app, host="0.0.0.0", port=8765, **kwargs)
