@@ -1,0 +1,4 @@
+# Ignore raw/source audio files (large)
+*_raw.wav
+*_raw.mp3
+*_raw.m4a
