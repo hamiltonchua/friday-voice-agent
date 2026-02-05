@@ -8,7 +8,7 @@ conda activate chatterbox
 # Set TTS engine
 export TTS_ENGINE=chatterbox
 
-# Voice cloning reference (Rosamund Pike)
+# Voice cloning reference (Majel Barrett / TNG Ship Computer)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CHATTERBOX_REF="$SCRIPT_DIR/voices/rosamund_pike.wav"
 
