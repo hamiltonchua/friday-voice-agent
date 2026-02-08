@@ -375,7 +375,7 @@ async def websocket_endpoint(ws: WebSocket):
     enrolling = False
 
     async def process_audio(audio_bytes: bytes):
-        nonlocal cancel_event, last_activity
+        nonlocal cancel_event, last_activity, client_state
         cancel_event.clear()
         last_activity = time.time()
 
