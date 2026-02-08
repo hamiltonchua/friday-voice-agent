@@ -21,7 +21,13 @@ import torch
 # Config
 # ---------------------------------------------------------------------------
 VOICES_DIR = Path(__file__).parent / "voices"
-ENROLLMENT_PATH = VOICES_DIR / "ham_embedding.npy"
+_PERSISTENT_DIR = Path.home() / ".kismet" / "voices"
+# Prefer persistent path in home directory, fall back to repo-local
+ENROLLMENT_PATH = (
+    _PERSISTENT_DIR / "ham_embedding.npy"
+    if (_PERSISTENT_DIR / "ham_embedding.npy").exists()
+    else VOICES_DIR / "ham_embedding.npy"
+)
 DEFAULT_THRESHOLD = float(os.getenv("SPEAKER_VERIFY_THRESHOLD", "0.65"))
 
 # ---------------------------------------------------------------------------
@@ -85,7 +91,7 @@ def compare(embedding: np.ndarray, enrolled_embedding: np.ndarray) -> float:
     return float(dot / norm)
 
 
-def enroll(audio_samples: list[bytes], save_path: Path = ENROLLMENT_PATH) -> np.ndarray:
+def enroll(audio_samples: list[bytes], save_path: Path = _PERSISTENT_DIR / "ham_embedding.npy") -> np.ndarray:
     """
     Enroll a speaker from multiple audio samples.
     Extracts embeddings from each, averages them, saves to disk.

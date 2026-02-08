@@ -102,12 +102,13 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 ## Phase 6: Wake Word + Speaker Verification Combined (v0.7)
 *Wake word triggers listening, speaker verification gates processing.*
 
-- [ ] Integrate wake word (Phase 4) with speaker verification (Phase 5)
-- [ ] Flow: wake_word → record speech → verify speaker → if verified, transcribe + respond
+- [x] Integrate wake word (Phase 4) with speaker verification (Phase 5)
+- [x] Flow: wake_word → record speech → verify speaker → if verified, transcribe + respond
+- [x] On rejected speaker: return to sleep state (server + client)
 - [ ] Reject unrecognized speakers with audio feedback ("I don't recognize your voice")
-- [ ] Configurable: wake word only, verification only, or both
+- [x] Configurable: wake word only, verification only, or both (via env vars)
 
-**Estimated effort:** 1 day
+**Completed:** 2026-02-08
 **Depends on:** Phase 4 + Phase 5
 
 ---
