@@ -304,7 +304,7 @@ async def websocket_endpoint(ws: WebSocket):
         if _should_verify():
             import speaker_verify
             t_sv = time.time()
-            enrolled = speaker_enrolled_embedding or _load_enrolled_embedding()
+            enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
             if enrolled is not None:
                 embedding = await loop.run_in_executor(None, speaker_verify.extract_embedding, audio_bytes)
                 score = speaker_verify.compare(embedding, enrolled)
