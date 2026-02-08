@@ -79,7 +79,40 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 
 ---
 
-## Phase 5: Polish & Hardening (v1.0)
+## Phase 5: Speaker Verification (v0.6) 🔧 In Progress
+*Only respond to recognized voices. Reject strangers.*
+
+- [x] SpeechBrain ECAPA-TDNN speaker verification module (`speaker_verify.py`)
+  - Runs on CPU to keep GPU free for whisper + chatterbox
+  - Embedding extraction, cosine similarity comparison
+  - Enrollment: average multiple samples → save to `voices/ham_embedding.npy`
+  - Verification: compare incoming audio against enrolled embedding
+- [x] Enrollment flow via WebSocket (enroll_start → enroll_sample × N → enroll_complete)
+- [x] Runtime verification gate in `process_audio()` — reject unrecognized speakers before STT
+- [x] UI: Enrollment modal with guided prompts (3 sentences)
+- [x] UI: Verification toggle, status badges, similarity scores
+- [x] Configurable threshold via `SPEAKER_VERIFY_THRESHOLD` env var (default 0.65)
+- [x] `SPEAKER_VERIFY` env var: "auto" (verify if enrolled), "true", "false"
+
+**Branch:** `feat/speaker-verification`
+**Depends on:** Phase 3 (interruption)
+
+---
+
+## Phase 6: Wake Word + Speaker Verification Combined (v0.7)
+*Wake word triggers listening, speaker verification gates processing.*
+
+- [ ] Integrate wake word (Phase 4) with speaker verification (Phase 5)
+- [ ] Flow: wake_word → record speech → verify speaker → if verified, transcribe + respond
+- [ ] Reject unrecognized speakers with audio feedback ("I don't recognize your voice")
+- [ ] Configurable: wake word only, verification only, or both
+
+**Estimated effort:** 1 day
+**Depends on:** Phase 4 + Phase 5
+
+---
+
+## Phase 7: Polish & Hardening (v1.0)
 *Production-quality touches.*
 
 - [ ] Reconnection handling (WebSocket drops, server restarts)
@@ -90,6 +123,8 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 - [ ] Conversation export (save transcript)
 - [ ] Startup as a systemd service (optional)
 - [ ] Performance profiling (GPU memory, latency benchmarks)
+- [ ] Multi-speaker enrollment (recognize different users)
+- [ ] Voice profile management UI
 
 **Estimated effort:** 1-2 days
 **Branch:** various `feat/*` and `fix/*`
@@ -108,13 +143,15 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
   │
   └─── WebSocket ───→ [Server on discovery:8765]
                          │
+                         ├─ Speaker Verification (CPU) — ECAPA-TDNN
                          ├─ faster-whisper (GPU) — STT
                          ├─ OpenClaw API — LLM
-                         └─ Kokoro ONNX — TTS (sentence-level streaming)
+                         └─ Chatterbox Turbo (GPU) — TTS
 ```
 
 ## Notes
 - Each phase is a separate git branch, merged to main when stable
 - Phases are incremental — each one works standalone on top of the previous
-- GPU VRAM budget: ~4GB used (whisper 3GB + kokoro 300MB), ~8GB headroom
-- Wake word engine should run on CPU to avoid competing with STT/TTS for GPU
+- GPU VRAM budget: ~4GB used (whisper 3GB + chatterbox), ~8GB headroom
+- Wake word + speaker verification run on CPU to avoid competing with STT/TTS for GPU
+- Speaker verification adds ~50-100ms latency per request (CPU embedding extraction)

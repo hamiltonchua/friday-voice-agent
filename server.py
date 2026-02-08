@@ -46,6 +46,8 @@ OPENCLAW_URL = os.getenv("OPENCLAW_URL", "http://127.0.0.1:18789/v1/chat/complet
 OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "92c0ca8eeb7054cd6587b7368e83f25673e41c7b0cf9985b")
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT", "main")
 
+SPEAKER_VERIFY = os.getenv("SPEAKER_VERIFY", "auto")  # "true", "false", or "auto" (verify if enrolled)
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "You are Kismet, a voice assistant. Your response will be spoken aloud via TTS. "
     "STRICT RULES: No emoji. No emoticons. No markdown. No bullet lists. No code blocks. No asterisks. No special characters. "
@@ -57,6 +59,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
 # Global singletons
 # ---------------------------------------------------------------------------
 whisper_model = None
+speaker_enrolled_embedding = None  # Cached enrollment embedding
 tts_model = None
 tts_sample_rate = None
 wake_word_model = None
@@ -93,6 +96,7 @@ def get_tts():
     return tts_model, tts_sample_rate
 
 
+
 def get_wake_word():
     global wake_word_model
     if wake_word_model is None and WAKE_WORD_ENABLED:
@@ -101,6 +105,25 @@ def get_wake_word():
         wake_word_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework='tflite')
         print(f"[WakeWord] Ready. Threshold: {WAKE_WORD_THRESHOLD}")
     return wake_word_model
+
+
+def _should_verify() -> bool:
+    """Check if speaker verification is enabled."""
+    if SPEAKER_VERIFY == "false":
+        return False
+    if SPEAKER_VERIFY == "true":
+        return True
+    # "auto" — verify only if enrollment exists
+    import speaker_verify
+    return speaker_verify.has_enrollment()
+
+
+def _load_enrolled_embedding():
+    """Load and cache enrolled embedding."""
+    global speaker_enrolled_embedding
+    import speaker_verify
+    speaker_enrolled_embedding = speaker_verify.load_enrollment()
+    return speaker_enrolled_embedding
 
 
 # ---------------------------------------------------------------------------
@@ -347,10 +370,31 @@ async def websocket_endpoint(ws: WebSocket):
                     except:
                         break
 
+    # Enrollment session state
+    enrollment_samples = []
+    enrolling = False
+
     async def process_audio(audio_bytes: bytes):
         nonlocal cancel_event, last_activity
         cancel_event.clear()
         last_activity = time.time()
+
+        # 0. Speaker verification gate
+        if _should_verify():
+            import speaker_verify
+            t_sv = time.time()
+            enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
+            if enrolled is not None:
+                embedding = await loop.run_in_executor(None, speaker_verify.extract_embedding, audio_bytes)
+                score = speaker_verify.compare(embedding, enrolled)
+                sv_time = time.time() - t_sv
+                if score < speaker_verify.DEFAULT_THRESHOLD:
+                    print(f"[Speaker] Rejected: score={score:.3f} ({sv_time:.2f}s)")
+                    await ws.send_json({"type": "rejected", "score": round(score, 3), "time": round(sv_time, 2)})
+                    return
+                print(f"[Speaker] Verified: score={score:.3f} ({sv_time:.2f}s)")
+                # Pass score along for UI display
+                await ws.send_json({"type": "verified", "score": round(score, 3), "time": round(sv_time, 2)})
 
         # 1. STT
         await ws.send_json({"type": "status", "text": "Transcribing..."})
@@ -477,6 +521,45 @@ async def websocket_endpoint(ws: WebSocket):
                 print("[WS] Cancel requested")
                 cancel_event.set()
                 await ws.send_json({"type": "cancelled"})
+
+            elif msg["type"] == "enroll_start":
+                enrolling = True
+                enrollment_samples.clear()
+                await ws.send_json({"type": "enroll_status", "status": "started", "samples": 0})
+
+            elif msg["type"] == "enroll_sample":
+                if enrolling:
+                    sample_bytes = base64.b64decode(msg["data"])
+                    enrollment_samples.append(sample_bytes)
+                    await ws.send_json({"type": "enroll_status", "status": "sample_received", "samples": len(enrollment_samples)})
+
+            elif msg["type"] == "enroll_complete":
+                if enrolling and len(enrollment_samples) >= 1:
+                    import speaker_verify
+                    await ws.send_json({"type": "enroll_status", "status": "processing"})
+                    avg_emb = await loop.run_in_executor(None, speaker_verify.enroll, enrollment_samples)
+                    # Update cached embedding
+                    global speaker_enrolled_embedding
+                    speaker_enrolled_embedding = avg_emb
+                    enrolling = False
+                    enrollment_samples.clear()
+                    await ws.send_json({"type": "enroll_status", "status": "complete"})
+                else:
+                    await ws.send_json({"type": "enroll_status", "status": "error", "message": "Not enough samples"})
+
+            elif msg["type"] == "enroll_cancel":
+                enrolling = False
+                enrollment_samples.clear()
+                await ws.send_json({"type": "enroll_status", "status": "cancelled"})
+
+            elif msg["type"] == "check_enrollment":
+                import speaker_verify
+                await ws.send_json({"type": "enrollment_info", "enrolled": speaker_verify.has_enrollment(), "verify_enabled": _should_verify()})
+
+            elif msg["type"] == "toggle_verify":
+                global SPEAKER_VERIFY
+                SPEAKER_VERIFY = "true" if msg.get("enabled") else "false"
+                await ws.send_json({"type": "verify_toggled", "enabled": msg.get("enabled", False)})
 
             elif msg["type"] == "clear":
                 cancel_event.set()

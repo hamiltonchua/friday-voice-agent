@@ -13,5 +13,8 @@ __pycache__/
 # Logs
 *.log
 
+# Speaker enrollment data
+voices/*_embedding.npy
+
 # OS
 .DS_Store

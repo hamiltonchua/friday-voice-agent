@@ -1,0 +1,13 @@
+# Kismet Voice Agent dependencies
+fastapi
+uvicorn[standard]
+httpx
+numpy
+faster-whisper
+
+# TTS engines
+kokoro-onnx
+chatterbox-tts
+
+# Speaker verification (Phase 5)
+speechbrain>=1.0.0
