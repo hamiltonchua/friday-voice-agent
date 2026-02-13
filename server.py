@@ -102,7 +102,7 @@ def get_wake_word():
     if wake_word_model is None and WAKE_WORD_ENABLED:
         from openwakeword.model import Model
         print(f"[WakeWord] Loading model: {WAKE_WORD_MODEL}...")
-        wake_word_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework='tflite')
+        wake_word_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework='onnx')
         print(f"[WakeWord] Ready. Threshold: {WAKE_WORD_THRESHOLD}")
     return wake_word_model
 
