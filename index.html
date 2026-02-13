@@ -550,6 +550,7 @@ function connect() {
       idleTimeout = msg.idle_timeout || 30;
       
       if (wakeWordEnabled) {
+        wakeToggle.style.display = '';
         console.log(`[WakeWord] Available: "${wakeWordName}", idle timeout: ${idleTimeout}s`);
         // Restore wake word state on reconnect, or auto-enable on first connect
         if (savedWakeWordActive || !wasConnected || wakeWordActive) {
@@ -558,6 +559,7 @@ function connect() {
           updateStatusForMode();
         }
       } else {
+        wakeToggle.style.display = 'none';
         updateStatusForMode();
       }
       // Check speaker enrollment
