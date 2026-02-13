@@ -31,7 +31,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "float16")
 TTS_ENGINE = os.getenv("TTS_ENGINE", "chatterbox")  # "chatterbox" or "kokoro"
-KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_sky")
 CHATTERBOX_REF = os.getenv("CHATTERBOX_REF", None)  # Optional reference audio for voice cloning
 STT_SAMPLE_RATE = 16000
 
