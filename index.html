@@ -559,12 +559,11 @@ function connect() {
           updateStatusForMode();
         }
       } else {
-        wakeToggle.style.display = 'none';
-        // No wake word — go straight to VAD (hands-free) mode
-        clientState = 'awake';
-        micBtn.classList.add('vad-active');
-        setStatus('Listening...', 'listening');
-        startVAD();
+        // No wake word — repurpose button as hands-free VAD toggle
+        wakeToggle.style.display = '';
+        wakeToggle.title = 'Toggle hands-free listening';
+        wakeToggle.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v4a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 19v2"/><path d="M8 21h8"/></svg>';
+        updateStatusForMode();
       }
       // Check speaker enrollment
       ws.send(JSON.stringify({ type: 'check_enrollment' }));
@@ -1110,9 +1109,29 @@ document.addEventListener('keyup', (e) => {
   }
 });
 
-wakeToggle.addEventListener('click', () => {
+wakeToggle.addEventListener('click', async () => {
   if (!wakeWordEnabled) {
-    setStatus('Wake word not available on server', 'active');
+    // No wake word — use as hands-free VAD toggle
+    if (vadInstance && !vadInstance.listening) {
+      // Turn on hands-free
+      clientState = 'awake';
+      micBtn.classList.add('vad-active');
+      wakeToggle.classList.add('active');
+      setStatus('Listening...', 'listening');
+      await startVAD();
+    } else if (vadInstance && vadInstance.listening) {
+      // Turn off hands-free
+      stopVAD();
+      wakeToggle.classList.remove('active');
+      setStatus('Click mic to talk', '');
+    } else {
+      // First time — init and start
+      clientState = 'awake';
+      micBtn.classList.add('vad-active');
+      wakeToggle.classList.add('active');
+      setStatus('Listening...', 'listening');
+      await startVAD();
+    }
     return;
   }
   if (wakeWordActive) {
