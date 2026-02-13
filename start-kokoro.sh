@@ -11,6 +11,10 @@ export PYTHONNOUSERSITE=1
 # Set TTS engine
 export TTS_ENGINE=kokoro
 
+# Feature flags (set to "false" to disable)
+export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-false}
+export SPEAKER_VERIFY=${SPEAKER_VERIFY:-false}
+
 # Unbuffered output for logging
 export PYTHONUNBUFFERED=1
 

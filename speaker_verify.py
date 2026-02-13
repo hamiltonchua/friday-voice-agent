@@ -28,7 +28,7 @@ ENROLLMENT_PATH = (
     if (_PERSISTENT_DIR / "ham_embedding.npy").exists()
     else VOICES_DIR / "ham_embedding.npy"
 )
-DEFAULT_THRESHOLD = float(os.getenv("SPEAKER_VERIFY_THRESHOLD", "0.65"))
+DEFAULT_THRESHOLD = float(os.getenv("SPEAKER_VERIFY_THRESHOLD", "0.50"))
 
 # ---------------------------------------------------------------------------
 # Model singleton

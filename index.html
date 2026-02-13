@@ -865,11 +865,11 @@ async function initVAD() {
 
   try {
     vadInstance = await vad.MicVAD.new({
-      positiveSpeechThreshold: 0.8,
-      negativeSpeechThreshold: 0.3,
-      minSpeechFrames: 5,
+      positiveSpeechThreshold: 0.9,
+      negativeSpeechThreshold: 0.35,
+      minSpeechFrames: 8,
       preSpeechPadFrames: 10,
-      redemptionFrames: 15,
+      redemptionFrames: 20,
       onFrameProcessed: (probs) => {
         // Use VAD speech probability as audio level proxy
         updateAudioLevel(probs.isSpeech * 0.5);

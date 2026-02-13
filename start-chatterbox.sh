@@ -11,6 +11,10 @@ export PYTHONNOUSERSITE=1
 # Set TTS engine
 export TTS_ENGINE=chatterbox
 
+# Feature flags (set to "false" to disable)
+export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-false}
+export SPEAKER_VERIFY=${SPEAKER_VERIFY:-false}
+
 # Voice cloning reference (Majel Barrett / TNG Ship Computer)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CHATTERBOX_REF="$SCRIPT_DIR/voices/rosamund_pike.wav"
