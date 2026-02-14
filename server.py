@@ -811,21 +811,8 @@ async def websocket_endpoint(ws: WebSocket):
         if meeting_session is None:
             return
 
-        # 1. Verify it's Ham
-        if _should_verify():
-            try:
-                import speaker_verify
-                enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
-                if enrolled is not None:
-                    embedding = await loop.run_in_executor(None, speaker_verify.extract_embedding, audio_bytes)
-                    score = speaker_verify.compare(embedding, enrolled)
-                    if score < speaker_verify.DEFAULT_THRESHOLD:
-                        print(f"[Meeting] Command rejected: score={score:.3f}")
-                        await ws.send_json({"type": "rejected", "score": round(float(score), 3)})
-                        return
-                    await ws.send_json({"type": "verified", "score": round(float(score), 3)})
-            except Exception as e:
-                print(f"[Meeting] Speaker verify error: {e}")
+        # Skip speaker verification for meeting commands — Ham already identified at meeting start
+        print(f"[Meeting] Processing command ({len(audio_bytes)} bytes)")
 
         # 2. Transcribe the command
         await ws.send_json({"type": "status", "text": "Transcribing command..."})

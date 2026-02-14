@@ -864,18 +864,29 @@ async function handleMeetingWake() {
   console.log('[Meeting] Wake word detected — capturing command...');
   meetingCommandCapture = true;
 
-  // Play a subtle audio cue
+  // Stop wake word streaming to avoid audio conflicts
+  stopWakeWordStreaming();
+
+  // Audio cue — short beep
+  try {
+    const actx = new AudioContext();
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.connect(gain).connect(actx.destination);
+    osc.start();
+    osc.stop(actx.currentTime + 0.15);
+    osc.onended = () => actx.close();
+  } catch (e) {}
+
   setStatus('🎤 Listening for your command...', 'listening');
   meetingBanner.textContent = '🎤 LISTENING — Speak your command...';
 
-  // Pause passive transcription VAD, start command-capture VAD
+  // Pause passive transcription VAD briefly, then restart for command capture
   if (vadInstance) vadInstance.pause();
-
-  // Brief delay then restart VAD — next speech end goes as meeting_command
-  await new Promise(r => setTimeout(r, 200));
-  if (vadInstance) {
-    vadInstance.start();
-  }
+  await new Promise(r => setTimeout(r, 300));
+  if (vadInstance) vadInstance.start();
 }
 
 function handleSleep() {
@@ -1046,6 +1057,8 @@ function sendAudio(float32Audio) {
     ws.send(JSON.stringify({ type: 'meeting_command', data: b64 }));
     setStatus('Processing command...', 'active');
     meetingBanner.textContent = '🔴 MEETING MODE — Transcribing • Say "Hey Friday" to ask Kismet';
+    // Restart wake word streaming for next command
+    if (wakeWordEnabled) startWakeWordStreaming();
   } else if (meetingMode) {
     // In meeting mode, VAD audio goes to passive transcription
     ws.send(JSON.stringify({ type: 'meeting_audio', data: b64 }));
