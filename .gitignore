@@ -19,3 +19,4 @@ voices/*_embedding.npy
 # OS
 .DS_Store
 .env
+*.ppn
