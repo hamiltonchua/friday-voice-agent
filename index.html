@@ -1054,6 +1054,8 @@ function updateStatusForMode() {
     } else {
       setStatus('Listening — talk anytime', 'active');
     }
+  } else if (vadInstance && vadInstance.listening) {
+    setStatus('Listening...', 'listening');
   } else {
     setStatus('Ready — hold mic to talk', 'active');
   }
