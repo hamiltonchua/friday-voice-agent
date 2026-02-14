@@ -260,6 +260,55 @@
   .verify-badge.pass { background: rgba(0,217,126,0.2); color: var(--green); }
   .verify-badge.fail { background: rgba(233,69,96,0.2); color: var(--accent); }
 
+  /* Meeting companion */
+  .meeting-banner {
+    display: none;
+    background: rgba(233,69,96,0.15);
+    color: var(--accent);
+    text-align: center;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .meeting-banner.show { display: block; }
+  .meeting-entry {
+    padding: 4px 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .meeting-entry .speaker {
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  .meeting-entry .speaker.ham { color: var(--green); }
+  .meeting-entry .speaker.other { color: var(--accent2); }
+  .meeting-entry .speaker.kismet { color: var(--accent); }
+  .meeting-entry .timestamp {
+    color: var(--dim);
+    font-size: 0.7rem;
+    margin-right: 6px;
+  }
+  #commandBtn {
+    display: none;
+    position: fixed;
+    bottom: 100px;
+    right: 20px;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: none;
+    color: white;
+    font-size: 1.2rem;
+    cursor: pointer;
+    z-index: 50;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  }
+  #commandBtn:hover { background: var(--accent2); }
+  #commandBtn.recording { background: var(--green); animation: pulse 1s infinite; }
+
   /* Enrollment modal */
   .modal-overlay {
     display: none;
@@ -337,6 +386,7 @@
   <div class="header-row">
     <button class="header-btn" id="enrollBtn" title="Enroll your voice for speaker verification">🎤 Enroll Voice</button>
     <button class="header-btn" id="verifyToggle" title="Toggle speaker verification">🔒 Verify: Off</button>
+    <button class="header-btn" id="meetingToggle" title="Toggle meeting companion mode">📋 Meeting</button>
   </div>
 </header>
 
@@ -362,7 +412,9 @@
 <div class="error-toast" id="errorToast"></div>
 
 <div id="status">Connecting...</div>
+<div class="meeting-banner" id="meetingBanner">🔴 MEETING MODE — Transcribing • Hold command button to ask Kismet</div>
 <div id="chat"></div>
+<button id="commandBtn" title="Hold to give Kismet a command">💬</button>
 
 <div id="controls">
   <button class="btn" id="clearBtn" title="Clear conversation">
@@ -626,6 +678,31 @@ function connect() {
       streamingText = '';
       isProcessing = false;
       updateStatusForMode();
+
+    // Meeting companion messages
+    } else if (msg.type === 'meeting_transcript') {
+      const div = document.createElement('div');
+      div.className = 'meeting-entry';
+      const ts = document.createElement('span');
+      ts.className = 'timestamp';
+      ts.textContent = msg.time;
+      const spk = document.createElement('span');
+      spk.className = 'speaker ' + (msg.is_owner ? 'ham' : msg.speaker === 'Kismet' ? 'kismet' : 'other');
+      spk.textContent = msg.speaker + ':';
+      div.appendChild(ts);
+      div.appendChild(spk);
+      div.appendChild(document.createTextNode(' ' + msg.text));
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+    } else if (msg.type === 'meeting_started') {
+      console.log('[Meeting] Started');
+
+    } else if (msg.type === 'meeting_stopped') {
+      addMessage('system', `Meeting ended. ${msg.entries} entries, ${msg.speakers.length} speakers: ${msg.speakers.join(', ')}`);
+      if (msg.transcript) {
+        console.log('[Meeting] Full transcript:\n' + msg.transcript);
+      }
     } else if (msg.type === 'cancelled') {
       console.log('[WS] Server confirmed cancel');
       isProcessing = false;
@@ -885,12 +962,12 @@ async function initVAD() {
         updateAudioLevel(probs.isSpeech * 0.5);
       },
       onSpeechStart: () => {
-        if (isSpeaking || isProcessing) {
+        if (!meetingMode && (isSpeaking || isProcessing)) {
           // Only interrupt if speech confidence is high enough (avoid echo triggering)
           interrupt();
         }
         micBtn.classList.add('recording');
-        setStatus('Listening...', 'listening');
+        setStatus(meetingMode ? 'Meeting mode — speaking detected...' : 'Listening...', 'listening');
       },
       onSpeechEnd: (audio) => {
         micBtn.classList.remove('recording');
@@ -934,9 +1011,16 @@ function sendAudio(float32Audio) {
   }
 
   const b64 = arrayBufferToBase64(int16.buffer);
-  ws.send(JSON.stringify({ type: 'audio', data: b64 }));
-  isProcessing = true;
-  setStatus('Processing...', 'active');
+
+  if (meetingMode) {
+    // In meeting mode, VAD audio goes to passive transcription
+    ws.send(JSON.stringify({ type: 'meeting_audio', data: b64 }));
+    setStatus('Meeting mode — listening...', 'listening');
+  } else {
+    ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+    isProcessing = true;
+    setStatus('Processing...', 'active');
+  }
 }
 
 // ---- Manual recording (fallback) ----
@@ -1298,6 +1382,143 @@ verifyToggle.addEventListener('click', () => {
   ws.send(JSON.stringify({ type: 'toggle_verify', enabled: verifyEnabled }));
   updateVerifyUI();
 });
+
+// ---- Meeting Companion Mode ----
+const meetingToggle = document.getElementById('meetingToggle');
+const meetingBanner = document.getElementById('meetingBanner');
+const commandBtn = document.getElementById('commandBtn');
+let meetingMode = false;
+let commandRecording = false;
+let commandRecorder = null;
+let commandChunks = [];
+let commandStream = null;
+
+function enterMeetingMode() {
+  meetingMode = true;
+  meetingToggle.classList.add('active');
+  meetingToggle.textContent = '📋 End Meeting';
+  meetingBanner.classList.add('show');
+  commandBtn.style.display = 'block';
+
+  // Start VAD for passive transcription
+  ws.send(JSON.stringify({ type: 'meeting_start' }));
+
+  // Clear chat for meeting transcript
+  chatEl.innerHTML = '';
+  addMessage('system', 'Meeting mode started. Transcribing all speakers...');
+
+  // Start VAD — audio goes to meeting_audio instead of regular audio
+  startMeetingVAD();
+  setStatus('Meeting mode — listening...', 'listening');
+}
+
+function exitMeetingMode() {
+  meetingMode = false;
+  meetingToggle.classList.remove('active');
+  meetingToggle.textContent = '📋 Meeting';
+  meetingBanner.classList.remove('show');
+  commandBtn.style.display = 'none';
+
+  ws.send(JSON.stringify({ type: 'meeting_stop' }));
+
+  // Stop meeting VAD
+  stopVAD();
+  updateStatusForMode();
+}
+
+async function startMeetingVAD() {
+  if (!vadInstance) await initVAD();
+  if (vadInstance) {
+    // Override onSpeechEnd to send to meeting_audio
+    vadInstance.start();
+    micBtn.classList.add('vad-active');
+  }
+}
+
+meetingToggle.addEventListener('click', () => {
+  if (meetingMode) {
+    exitMeetingMode();
+  } else {
+    enterMeetingMode();
+  }
+});
+
+// Command button — hold to record a command for Kismet
+commandBtn.addEventListener('mousedown', (e) => { e.preventDefault(); startCommandRecording(); });
+commandBtn.addEventListener('mouseup', (e) => { e.preventDefault(); stopCommandRecording(); });
+commandBtn.addEventListener('mouseleave', () => { if (commandRecording) stopCommandRecording(); });
+commandBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startCommandRecording(); });
+commandBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopCommandRecording(); });
+
+async function startCommandRecording() {
+  if (commandRecording) return;
+  commandRecording = true;
+  commandBtn.classList.add('recording');
+  commandChunks = [];
+
+  // Pause VAD while recording command
+  if (vadInstance) vadInstance.pause();
+
+  commandStream = await navigator.mediaDevices.getUserMedia({
+    audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true }
+  });
+  const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  const source = ctx.createMediaStreamSource(commandStream);
+  const processor = ctx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    commandChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  source.connect(processor);
+  processor.connect(ctx.destination);
+  commandBtn._ctx = ctx;
+  commandBtn._processor = processor;
+  commandBtn._source = source;
+
+  setStatus('Recording command...', 'listening');
+}
+
+function stopCommandRecording() {
+  if (!commandRecording) return;
+  commandRecording = false;
+  commandBtn.classList.remove('recording');
+
+  if (commandBtn._processor) {
+    commandBtn._processor.disconnect();
+    commandBtn._source.disconnect();
+    commandBtn._ctx.close();
+  }
+  if (commandStream) {
+    commandStream.getTracks().forEach(t => t.stop());
+    commandStream = null;
+  }
+
+  // Merge chunks
+  const total = commandChunks.reduce((n, c) => n + c.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of commandChunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  commandChunks = [];
+
+  // Resume VAD
+  if (vadInstance && meetingMode) vadInstance.start();
+
+  if (merged.length < SAMPLE_RATE * 0.3) {
+    setStatus('Too short — hold longer', 'active');
+    return;
+  }
+
+  // Convert to int16 and send as meeting_command
+  const int16 = new Int16Array(merged.length);
+  for (let i = 0; i < merged.length; i++) {
+    int16[i] = Math.max(-32768, Math.min(32767, Math.round(merged[i] * 32767)));
+  }
+  const b64 = arrayBufferToBase64(int16.buffer);
+  ws.send(JSON.stringify({ type: 'meeting_command', data: b64 }));
+  setStatus('Processing command...', 'active');
+}
 
 // ---- Reconnect banner click ----
 reconnectBanner.addEventListener('click', () => {

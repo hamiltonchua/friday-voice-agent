@@ -43,10 +43,13 @@ CHATTERBOX_REF = os.getenv("CHATTERBOX_REF", None)  # Optional reference audio f
 MLX_TTS_VOICE = os.getenv("MLX_TTS_VOICE", "af_sky")  # Voice for MLX Kokoro
 STT_SAMPLE_RATE = 16000
 
-# Wake word config
-WAKE_WORD_MODEL = os.getenv("WAKE_WORD_MODEL", "hey_jarvis")  # hey_jarvis, alexa, hey_mycroft, etc.
-WAKE_WORD_THRESHOLD = float(os.getenv("WAKE_WORD_THRESHOLD", "0.5"))
+# Wake word config (Porcupine)
 WAKE_WORD_ENABLED = os.getenv("WAKE_WORD_ENABLED", "true").lower() == "true"
+PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY", "")
+# Built-in keywords: alexa, jarvis, computer, hey google, hey siri, picovoice, etc.
+# For custom keywords, set to path of .ppn file (e.g. /path/to/hey-friday.ppn)
+WAKE_WORD_KEYWORD = os.getenv("WAKE_WORD_KEYWORD", "jarvis")
+WAKE_WORD_SENSITIVITY = float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5"))  # 0.0-1.0
 IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "30"))  # Return to sleep after this many seconds of silence
 
 # OpenClaw gateway
@@ -76,6 +79,13 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "STRICT RULES: No emoji. No emoticons. No markdown. No bullet lists. No code blocks. No asterisks. No special characters. "
     "Keep responses concise and conversational. Just plain spoken English, like you're talking to someone. "
     "Be natural, warm, and to the point."
+))
+
+MEETING_SYSTEM_PROMPT = os.getenv("MEETING_SYSTEM_PROMPT", (
+    "You are Kismet, a meeting companion assistant. You have access to the meeting transcript so far. "
+    "When the user (Ham) asks you something, answer based on the transcript context. "
+    "STRICT RULES: No emoji. No emoticons. No markdown. No bullet lists. No code blocks. No asterisks. "
+    "Keep responses concise and conversational. Plain spoken English only."
 ))
 
 # ---------------------------------------------------------------------------
@@ -143,10 +153,27 @@ def get_wake_word():
     global wake_word_model
     with _model_lock:
         if wake_word_model is None and WAKE_WORD_ENABLED:
-            from openwakeword.model import Model
-            print(f"[WakeWord] Loading model: {WAKE_WORD_MODEL}...")
-            wake_word_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework='onnx')
-            print(f"[WakeWord] Ready. Threshold: {WAKE_WORD_THRESHOLD}")
+            import pvporcupine
+            if not PICOVOICE_ACCESS_KEY:
+                print("[WakeWord] ERROR: PICOVOICE_ACCESS_KEY not set. Disabling wake word.")
+                return None
+            # Check if keyword is a file path (.ppn) or built-in name
+            keyword = WAKE_WORD_KEYWORD
+            if keyword.endswith(".ppn") or os.path.sep in keyword:
+                print(f"[WakeWord] Loading custom keyword: {keyword}")
+                wake_word_model = pvporcupine.create(
+                    access_key=PICOVOICE_ACCESS_KEY,
+                    keyword_paths=[keyword],
+                    sensitivities=[WAKE_WORD_SENSITIVITY],
+                )
+            else:
+                print(f"[WakeWord] Loading built-in keyword: {keyword}")
+                wake_word_model = pvporcupine.create(
+                    access_key=PICOVOICE_ACCESS_KEY,
+                    keywords=[keyword],
+                    sensitivities=[WAKE_WORD_SENSITIVITY],
+                )
+            print(f"[WakeWord] Porcupine ready. Keyword: {keyword}, Sensitivity: {WAKE_WORD_SENSITIVITY}")
     return wake_word_model
 
 
@@ -213,28 +240,34 @@ def transcribe(audio_bytes: bytes) -> str:
         os.unlink(tmp_path)
 
 
+_porcupine_buffer = np.array([], dtype=np.int16)
+
 def detect_wake_word(audio_chunk: np.ndarray) -> tuple[bool, float]:
     """
-    Run wake word detection on an audio chunk.
+    Run wake word detection on an audio chunk using Porcupine.
     Returns (detected, confidence).
     Audio should be int16 @ 16kHz.
     """
+    global _porcupine_buffer
     model = get_wake_word()
     if model is None:
         return False, 0.0
-    
-    # OpenWakeWord expects chunks of 1280 samples (80ms at 16kHz)
-    # Feed whatever we have
-    prediction = model.predict(audio_chunk)
-    score = prediction.get(WAKE_WORD_MODEL, 0.0)
-    
-    detected = score >= WAKE_WORD_THRESHOLD
-    if detected:
-        print(f"[WakeWord] Detected! Score: {score:.3f}")
-        # Reset the model state after detection to avoid repeated triggers
-        model.reset()
-    
-    return detected, score
+
+    # Porcupine requires exactly frame_length samples (512 for 16kHz)
+    frame_len = model.frame_length
+    _porcupine_buffer = np.concatenate([_porcupine_buffer, audio_chunk])
+
+    detected = False
+    while len(_porcupine_buffer) >= frame_len:
+        frame = _porcupine_buffer[:frame_len]
+        _porcupine_buffer = _porcupine_buffer[frame_len:]
+        keyword_index = model.process(frame.tolist())
+        if keyword_index >= 0:
+            detected = True
+            print(f"[WakeWord] Detected! (keyword index {keyword_index})")
+            break
+
+    return detected, 1.0 if detected else 0.0
 
 
 # Sentence boundary pattern: ends with .!? followed by space or end
@@ -407,6 +440,77 @@ def synthesize(text: str) -> tuple[bytes, int]:
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Meeting Companion — speaker clustering + transcript
+# ---------------------------------------------------------------------------
+class MeetingSession:
+    """Tracks meeting transcript and speaker embeddings for diarization."""
+
+    def __init__(self, owner_embedding=None, similarity_threshold=0.75):
+        self.transcript: list[dict] = []  # [{speaker, text, time}]
+        self.owner_embedding = owner_embedding  # Ham's enrolled embedding
+        self.speaker_embeddings: dict[str, np.ndarray] = {}  # "Speaker 1" -> avg embedding
+        self.similarity_threshold = similarity_threshold
+        self._next_speaker_id = 1
+
+    def identify_speaker(self, embedding: np.ndarray) -> str:
+        """Identify speaker from embedding. Returns 'Ham' or 'Speaker N'."""
+        import speaker_verify
+
+        # Check if it's the owner (Ham)
+        if self.owner_embedding is not None:
+            score = speaker_verify.compare(embedding, self.owner_embedding)
+            if score >= speaker_verify.DEFAULT_THRESHOLD:
+                return "Ham"
+
+        # Check against known speakers
+        best_match = None
+        best_score = 0.0
+        for name, spk_emb in self.speaker_embeddings.items():
+            score = speaker_verify.compare(embedding, spk_emb)
+            if score > best_score:
+                best_score = score
+                best_match = name
+
+        if best_match and best_score >= self.similarity_threshold:
+            # Update running average for this speaker
+            old = self.speaker_embeddings[best_match]
+            updated = (old + embedding) / 2
+            self.speaker_embeddings[best_match] = updated / np.linalg.norm(updated)
+            return best_match
+
+        # New speaker
+        name = f"Speaker {self._next_speaker_id}"
+        self._next_speaker_id += 1
+        norm_emb = embedding / np.linalg.norm(embedding)
+        self.speaker_embeddings[name] = norm_emb
+        print(f"[Meeting] New speaker detected: {name}")
+        return name
+
+    def add_entry(self, speaker: str, text: str):
+        """Add a transcript entry."""
+        entry = {
+            "speaker": speaker,
+            "text": text,
+            "time": time.strftime("%H:%M:%S"),
+        }
+        self.transcript.append(entry)
+        return entry
+
+    def get_transcript_text(self, last_n: int = 0) -> str:
+        """Format transcript as plain text for LLM context."""
+        entries = self.transcript[-last_n:] if last_n else self.transcript
+        lines = []
+        for e in entries:
+            lines.append(f"[{e['time']}] {e['speaker']}: {e['text']}")
+        return "\n".join(lines)
+
+    def clear(self):
+        self.transcript.clear()
+        self.speaker_embeddings.clear()
+        self._next_speaker_id = 1
+
+
 app = FastAPI(title="Kismet Voice Agent")
 
 
@@ -415,6 +519,19 @@ async def startup_event():
     """Preload all models at server start, not per-connection."""
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, preload_models)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up Porcupine resources."""
+    global wake_word_model
+    if wake_word_model is not None:
+        try:
+            wake_word_model.delete()
+            print("[WakeWord] Porcupine cleaned up.")
+        except Exception:
+            pass
+        wake_word_model = None
 
 
 @app.get("/")
@@ -436,13 +553,16 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.send_json({
         "type": "ready",
         "wake_word_enabled": WAKE_WORD_ENABLED,
-        "wake_word": WAKE_WORD_MODEL if WAKE_WORD_ENABLED else None,
+        "wake_word": WAKE_WORD_KEYWORD if WAKE_WORD_ENABLED else None,
         "idle_timeout": IDLE_TIMEOUT_SEC,
     })
 
     # Client state: sleeping (wake word mode) or awake (VAD mode)
     client_state = "sleeping" if WAKE_WORD_ENABLED else "awake"
     last_activity = time.time()
+    # Reset Porcupine buffer for this connection
+    global _porcupine_buffer
+    _porcupine_buffer = np.array([], dtype=np.int16)
     
     # Cancellation event for current processing
     cancel_event = asyncio.Event()
@@ -463,6 +583,9 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "sleep"})
                     except:
                         break
+
+    # Meeting companion state
+    meeting_session = None  # None = normal mode, MeetingSession = meeting mode
 
     # Enrollment session state
     enrollment_samples = []
@@ -595,6 +718,180 @@ async def websocket_endpoint(ws: WebSocket):
                     "sentences": sentence_count,
                 })
 
+    async def process_meeting_audio(audio_bytes: bytes):
+        """Process audio in meeting mode: transcribe + identify speaker, no LLM."""
+        nonlocal meeting_session, last_activity
+        last_activity = time.time()
+
+        if meeting_session is None:
+            return
+
+        # 1. Extract speaker embedding
+        speaker_name = "Unknown"
+        try:
+            import speaker_verify
+            embedding = await loop.run_in_executor(None, speaker_verify.extract_embedding, audio_bytes)
+            speaker_name = meeting_session.identify_speaker(embedding)
+        except Exception as e:
+            print(f"[Meeting] Speaker ID error: {e}")
+
+        # 2. Transcribe
+        try:
+            text = await loop.run_in_executor(None, transcribe, audio_bytes)
+        except Exception as e:
+            print(f"[Meeting] STT error: {e}")
+            return
+
+        if not text:
+            return
+
+        # 3. Add to transcript and send to client
+        entry = meeting_session.add_entry(speaker_name, text)
+        print(f"[Meeting] [{entry['time']}] {speaker_name}: {text}")
+        await ws.send_json({
+            "type": "meeting_transcript",
+            "speaker": speaker_name,
+            "text": text,
+            "time": entry["time"],
+            "is_owner": speaker_name == "Ham",
+        })
+
+    async def process_meeting_command(audio_bytes: bytes):
+        """Process a direct command from Ham during meeting mode."""
+        nonlocal cancel_event, meeting_session, last_activity
+        cancel_event.clear()
+        last_activity = time.time()
+
+        if meeting_session is None:
+            return
+
+        # 1. Verify it's Ham
+        if _should_verify():
+            try:
+                import speaker_verify
+                enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
+                if enrolled is not None:
+                    embedding = await loop.run_in_executor(None, speaker_verify.extract_embedding, audio_bytes)
+                    score = speaker_verify.compare(embedding, enrolled)
+                    if score < speaker_verify.DEFAULT_THRESHOLD:
+                        print(f"[Meeting] Command rejected: score={score:.3f}")
+                        await ws.send_json({"type": "rejected", "score": round(float(score), 3)})
+                        return
+                    await ws.send_json({"type": "verified", "score": round(float(score), 3)})
+            except Exception as e:
+                print(f"[Meeting] Speaker verify error: {e}")
+
+        # 2. Transcribe the command
+        await ws.send_json({"type": "status", "text": "Transcribing command..."})
+        try:
+            user_text = await loop.run_in_executor(None, transcribe, audio_bytes)
+        except Exception as e:
+            await ws.send_json({"type": "error", "text": "Couldn't understand that"})
+            return
+
+        if not user_text:
+            return
+
+        await ws.send_json({"type": "transcript", "role": "user", "text": user_text})
+
+        # 3. Send to LLM with transcript context
+        transcript_context = meeting_session.get_transcript_text(last_n=50)
+        context_msg = f"=== MEETING TRANSCRIPT (last 50 entries) ===\n{transcript_context}\n=== END TRANSCRIPT ===\n\nHam's command: {user_text}"
+
+        await ws.send_json({"type": "status", "text": "Thinking..."})
+        await ws.send_json({"type": "stream_start"})
+
+        llm_start = time.time()
+        sentence_count = 0
+        total_tts_time = 0
+
+        # Use meeting system prompt + transcript context
+        meeting_messages = [
+            {"role": "system", "content": MEETING_SYSTEM_PROMPT},
+            {"role": "user", "content": context_msg},
+        ]
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            headers = {"Authorization": f"Bearer {OPENCLAW_TOKEN}"} if OPENCLAW_TOKEN else {}
+            payload = {
+                "model": OPENCLAW_AGENT,
+                "messages": meeting_messages,
+                "stream": True,
+            }
+
+            full_text = ""
+            buffer = ""
+
+            async with client.stream("POST", OPENCLAW_URL, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    await ws.send_json({"type": "error", "text": "LLM request failed"})
+                    return
+
+                async for line in resp.aiter_lines():
+                    if cancel_event.is_set():
+                        break
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        token = delta.get("content", "")
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+                    if not token:
+                        continue
+
+                    full_text += token
+                    buffer += token
+                    await ws.send_json({"type": "token", "text": token})
+
+                    # Check for sentence boundaries
+                    while SENTENCE_END_RE.search(buffer):
+                        match = SENTENCE_END_RE.search(buffer)
+                        sentence = buffer[:match.end()].strip()
+                        buffer = buffer[match.end():]
+
+                        if sentence and not cancel_event.is_set():
+                            try:
+                                tts_start = time.time()
+                                audio_out, sr = await loop.run_in_executor(None, synthesize, sentence)
+                                tts_time = time.time() - tts_start
+                                total_tts_time += tts_time
+                                audio_b64 = base64.b64encode(audio_out).decode()
+                                await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": sentence, "index": sentence_count})
+                                sentence_count += 1
+                            except Exception as e:
+                                print(f"[Meeting TTS] Error: {e}")
+
+            # Handle remaining buffer
+            if buffer.strip() and not cancel_event.is_set():
+                try:
+                    tts_start = time.time()
+                    audio_out, sr = await loop.run_in_executor(None, synthesize, buffer.strip())
+                    tts_time = time.time() - tts_start
+                    total_tts_time += tts_time
+                    audio_b64 = base64.b64encode(audio_out).decode()
+                    await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": buffer.strip(), "index": sentence_count})
+                    sentence_count += 1
+                except Exception:
+                    pass
+
+            # Add response to transcript
+            if full_text:
+                meeting_session.add_entry("Kismet", full_text)
+                conversation_history.append({"role": "assistant", "content": full_text})
+
+            await ws.send_json({
+                "type": "stream_end",
+                "text": full_text,
+                "times": {"llm": round(time.time() - llm_start, 2), "tts": round(total_tts_time, 2)},
+                "sentences": sentence_count,
+            })
+
     # Start idle check task if wake word is enabled
     if WAKE_WORD_ENABLED:
         idle_check_task = asyncio.create_task(check_idle())
@@ -678,9 +975,55 @@ async def websocket_endpoint(ws: WebSocket):
                 SPEAKER_VERIFY = "true" if msg.get("enabled") else "false"
                 await ws.send_json({"type": "verify_toggled", "enabled": msg.get("enabled", False)})
 
+            elif msg["type"] == "meeting_start":
+                # Start meeting companion mode
+                enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
+                meeting_session = MeetingSession(owner_embedding=enrolled)
+                print("[Meeting] Session started")
+                await ws.send_json({"type": "meeting_started"})
+
+            elif msg["type"] == "meeting_stop":
+                # Stop meeting mode, return transcript
+                if meeting_session:
+                    transcript = meeting_session.get_transcript_text()
+                    entry_count = len(meeting_session.transcript)
+                    speakers = list(meeting_session.speaker_embeddings.keys())
+                    if meeting_session.owner_embedding is not None:
+                        speakers = ["Ham"] + speakers
+                    meeting_session = None
+                    print(f"[Meeting] Session ended ({entry_count} entries)")
+                    await ws.send_json({
+                        "type": "meeting_stopped",
+                        "transcript": transcript,
+                        "entries": entry_count,
+                        "speakers": speakers,
+                    })
+                else:
+                    await ws.send_json({"type": "meeting_stopped", "transcript": "", "entries": 0, "speakers": []})
+
+            elif msg["type"] == "meeting_audio":
+                # Passive transcription in meeting mode
+                if meeting_session:
+                    audio_bytes = base64.b64decode(msg["data"])
+                    asyncio.create_task(process_meeting_audio(audio_bytes))
+
+            elif msg["type"] == "meeting_command":
+                # Ham's direct command during meeting
+                if meeting_session:
+                    if processing_task and not processing_task.done():
+                        cancel_event.set()
+                        try:
+                            await asyncio.wait_for(processing_task, timeout=2.0)
+                        except asyncio.TimeoutError:
+                            processing_task.cancel()
+                    audio_bytes = base64.b64decode(msg["data"])
+                    processing_task = asyncio.create_task(process_meeting_command(audio_bytes))
+
             elif msg["type"] == "clear":
                 cancel_event.set()
                 conversation_history.clear()
+                if meeting_session:
+                    meeting_session.clear()
                 await ws.send_json({"type": "status", "text": "Conversation cleared."})
 
             elif msg["type"] == "set_state":
@@ -717,5 +1060,5 @@ if __name__ == "__main__":
     print(f"[LLM] OpenClaw endpoint: {OPENCLAW_URL}")
     print(f"[TTS] Engine: {TTS_ENGINE} (backend: {TTS_BACKEND})")
     if WAKE_WORD_ENABLED:
-        print(f"[WakeWord] Model: {WAKE_WORD_MODEL}, Threshold: {WAKE_WORD_THRESHOLD}")
+        print(f"[WakeWord] Porcupine keyword: {WAKE_WORD_KEYWORD}, Sensitivity: {WAKE_WORD_SENSITIVITY}")
     uvicorn.run(app, host="0.0.0.0", port=8765, **kwargs)

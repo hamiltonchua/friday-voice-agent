@@ -32,6 +32,9 @@ export CHATTERBOX_REF="${CHATTERBOX_REF:-$SCRIPT_DIR/voices/rosamund_pike.wav}"
 
 # Feature flags (set to "false" to disable)
 export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-false}
+export PICOVOICE_ACCESS_KEY=${PICOVOICE_ACCESS_KEY:-""}
+export WAKE_WORD_KEYWORD=${WAKE_WORD_KEYWORD:-"jarvis"}  # built-in or path to .ppn
+export WAKE_WORD_SENSITIVITY=${WAKE_WORD_SENSITIVITY:-"0.5"}
 export SPEAKER_VERIFY=${SPEAKER_VERIFY:-auto}
 
 # Unbuffered output for logging
