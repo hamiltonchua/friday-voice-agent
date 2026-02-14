@@ -1443,8 +1443,8 @@ function enterMeetingMode() {
 
   // Start VAD — audio goes to meeting_audio instead of regular audio
   startMeetingVAD();
-  // Also start wake word streaming so "Hey Friday" works during meetings
-  if (wakeWordActive) startWakeWordStreaming();
+  // Always start wake word streaming in meeting mode (if server has wake word enabled)
+  if (wakeWordEnabled) startWakeWordStreaming();
   setStatus('Meeting mode — listening...', 'listening');
 }
 
