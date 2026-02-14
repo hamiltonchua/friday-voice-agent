@@ -412,7 +412,7 @@
 <div class="error-toast" id="errorToast"></div>
 
 <div id="status">Connecting...</div>
-<div class="meeting-banner" id="meetingBanner">🔴 MEETING MODE — Transcribing • Hold command button to ask Kismet</div>
+<div class="meeting-banner" id="meetingBanner">🔴 MEETING MODE — Transcribing • Say "Hey Friday" to ask Kismet</div>
 <div id="chat"></div>
 <button id="commandBtn" title="Hold to give Kismet a command">💬</button>
 
@@ -629,8 +629,13 @@ function connect() {
 
     } else if (msg.type === 'wake') {
       // Wake word detected!
-      console.log(`[WakeWord] Detected! Score: ${msg.score}`);
-      handleWake();
+      console.log(`[WakeWord] Detected! Score: ${msg.score}, meeting: ${msg.meeting}`);
+      if (msg.meeting && meetingMode) {
+        // In meeting mode: start VAD-based command capture
+        handleMeetingWake();
+      } else {
+        handleWake();
+      }
     } else if (msg.type === 'sleep') {
       // Server says go back to sleep
       console.log('[State] Server requested sleep');
@@ -852,6 +857,27 @@ async function handleWake() {
   console.log('[WakeWord] Transitioned to VAD listening');
 }
 
+let meetingCommandCapture = false;
+
+async function handleMeetingWake() {
+  // Wake word detected during meeting — capture next utterance as a command
+  console.log('[Meeting] Wake word detected — capturing command...');
+  meetingCommandCapture = true;
+
+  // Play a subtle audio cue
+  setStatus('🎤 Listening for your command...', 'listening');
+  meetingBanner.textContent = '🎤 LISTENING — Speak your command...';
+
+  // Pause passive transcription VAD, start command-capture VAD
+  if (vadInstance) vadInstance.pause();
+
+  // Brief delay then restart VAD — next speech end goes as meeting_command
+  await new Promise(r => setTimeout(r, 200));
+  if (vadInstance) {
+    vadInstance.start();
+  }
+}
+
 function handleSleep() {
   if (!wakeWordActive) return;  // Only if wake word mode is on
   
@@ -1012,7 +1038,13 @@ function sendAudio(float32Audio) {
 
   const b64 = arrayBufferToBase64(int16.buffer);
 
-  if (meetingMode) {
+  if (meetingMode && meetingCommandCapture) {
+    // Wake word triggered — this utterance is a command for Kismet
+    meetingCommandCapture = false;
+    ws.send(JSON.stringify({ type: 'meeting_command', data: b64 }));
+    setStatus('Processing command...', 'active');
+    meetingBanner.textContent = '🔴 MEETING MODE — Transcribing • Say "Hey Friday" to ask Kismet';
+  } else if (meetingMode) {
     // In meeting mode, VAD audio goes to passive transcription
     ws.send(JSON.stringify({ type: 'meeting_audio', data: b64 }));
     setStatus('Meeting mode — listening...', 'listening');
@@ -1405,10 +1437,12 @@ function enterMeetingMode() {
 
   // Clear chat for meeting transcript
   chatEl.innerHTML = '';
-  addMessage('system', 'Meeting mode started. Transcribing all speakers...');
+  addMessage('system', 'Meeting mode started. Transcribing all speakers... Say "Hey Friday" to ask a question.');
 
   // Start VAD — audio goes to meeting_audio instead of regular audio
   startMeetingVAD();
+  // Also start wake word streaming so "Hey Friday" works during meetings
+  if (wakeWordActive) startWakeWordStreaming();
   setStatus('Meeting mode — listening...', 'listening');
 }
 
@@ -1421,8 +1455,9 @@ function exitMeetingMode() {
 
   ws.send(JSON.stringify({ type: 'meeting_stop' }));
 
-  // Stop meeting VAD
+  // Stop meeting VAD and wake word streaming
   stopVAD();
+  stopWakeWordStreaming();
   updateStatusForMode();
 }
 

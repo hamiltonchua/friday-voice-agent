@@ -645,6 +645,52 @@ async def websocket_endpoint(ws: WebSocket):
         if cancel_event.is_set():
             return
 
+        # Voice commands for meeting mode
+        text_lower = user_text.strip().lower()
+        if any(phrase in text_lower for phrase in ["start meeting mode", "activate meeting mode", "turn on meeting mode", "enable meeting mode"]):
+            nonlocal meeting_session
+            enrolled = speaker_enrolled_embedding if speaker_enrolled_embedding is not None else _load_enrolled_embedding()
+            meeting_session = MeetingSession(owner_embedding=enrolled)
+            print("[Meeting] Session started via voice command")
+            await ws.send_json({"type": "meeting_started"})
+            reply = "Meeting mode activated. I'll transcribe in the background. Hold the command button when you need me."
+            await ws.send_json({"type": "stream_start"})
+            await ws.send_json({"type": "token", "text": reply})
+            try:
+                audio_out, _ = await loop.run_in_executor(None, synthesize, reply)
+                await ws.send_json({"type": "audio_chunk", "data": base64.b64encode(audio_out).decode(), "sentence": reply, "index": 0})
+            except Exception as e:
+                print(f"[TTS] Error: {e}")
+            await ws.send_json({"type": "stream_end"})
+            return
+        elif any(phrase in text_lower for phrase in ["stop meeting mode", "deactivate meeting mode", "turn off meeting mode", "disable meeting mode", "end meeting mode", "end meeting"]):
+            if meeting_session:
+                transcript = meeting_session.get_transcript_text()
+                entry_count = len(meeting_session.transcript)
+                speakers = list(meeting_session.speaker_embeddings.keys())
+                if meeting_session.owner_embedding is not None:
+                    speakers = ["Ham"] + speakers
+                meeting_session = None
+                print(f"[Meeting] Session ended via voice command ({entry_count} entries)")
+                await ws.send_json({
+                    "type": "meeting_stopped",
+                    "transcript": transcript,
+                    "entries": entry_count,
+                    "speakers": speakers,
+                })
+                reply = f"Meeting mode ended. I captured {entry_count} entries."
+            else:
+                reply = "Meeting mode isn't active right now."
+            await ws.send_json({"type": "stream_start"})
+            await ws.send_json({"type": "token", "text": reply})
+            try:
+                audio_out, _ = await loop.run_in_executor(None, synthesize, reply)
+                await ws.send_json({"type": "audio_chunk", "data": base64.b64encode(audio_out).decode(), "sentence": reply, "index": 0})
+            except Exception as e:
+                print(f"[TTS] Error: {e}")
+            await ws.send_json({"type": "stream_end"})
+            return
+
         # 2. LLM streaming + TTS per sentence
         await ws.send_json({"type": "status", "text": "Thinking..."})
         await ws.send_json({"type": "stream_start"})
@@ -915,8 +961,9 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg["type"] == "audio_stream":
                 # Streaming audio chunk for wake word detection
-                if client_state != "sleeping":
-                    continue  # Ignore if not in sleep mode
+                # Works in both sleep mode (normal) and meeting mode
+                if meeting_session is None and client_state != "sleeping":
+                    continue  # Normal mode: ignore if not sleeping
                 
                 audio_b64 = msg["data"]
                 audio_bytes = base64.b64decode(audio_b64)
@@ -926,10 +973,16 @@ async def websocket_endpoint(ws: WebSocket):
                 detected, score = await loop.run_in_executor(None, detect_wake_word, audio_chunk)
                 
                 if detected:
-                    client_state = "awake"
                     last_activity = time.time()
-                    print(f"[State] Wake word detected, now awake")
-                    await ws.send_json({"type": "wake", "score": round(float(score), 3)})
+                    if meeting_session is not None:
+                        # Meeting mode: wake triggers command recording
+                        print(f"[State] Wake word detected in meeting mode")
+                        await ws.send_json({"type": "wake", "score": round(float(score), 3), "meeting": True})
+                    else:
+                        # Normal mode: transition from sleeping to awake
+                        client_state = "awake"
+                        print(f"[State] Wake word detected, now awake")
+                        await ws.send_json({"type": "wake", "score": round(float(score), 3)})
 
             elif msg["type"] == "cancel":
                 print("[WS] Cancel requested")
