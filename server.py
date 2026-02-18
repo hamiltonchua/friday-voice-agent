@@ -309,7 +309,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                     "x-openclaw-agent-id": OPENCLAW_AGENT,
                 },
                 json={
-                    "model": "openclaw",
+                    "model": "anthropic/claude-sonnet-4-6",
                     "messages": messages,
                     "user": "voice-chat",
                     "stream": True,

@@ -1,7 +1,7 @@
 // frontend/src/components/SettingsDrawer.tsx
 import { Settings } from 'lucide-react'
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from './ui/sheet'
-import { ENROLL_REQUIRED } from '../constants'
+import { ENROLL_MIN, ENROLL_MAX } from '../constants'
 
 interface SettingsDrawerProps {
   enrolled: boolean
@@ -22,6 +22,7 @@ export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyTogg
         </button>
       </SheetTrigger>
       <SheetContent side="left">
+        <div style={{ padding: '24px 20px' }}>
         <SheetHeader>
           <SheetTitle>Settings</SheetTitle>
         </SheetHeader>
@@ -78,10 +79,11 @@ export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyTogg
 
             <p style={{ fontSize: '0.7rem', color: 'var(--text2)', marginTop: 8 }}>
               {enrolled
-                ? `Enrolled (${ENROLL_REQUIRED} samples). Verification is ${verifyEnabled ? 'on' : 'off'}.`
-                : `Not enrolled. Record ${ENROLL_REQUIRED} voice samples to enable speaker verification.`}
+                ? `Enrolled. Verification is ${verifyEnabled ? 'on' : 'off'}.`
+                : `Not enrolled. Record ${ENROLL_MIN}–${ENROLL_MAX} voice samples to enable speaker verification.`}
             </p>
           </div>
+        </div>
         </div>
       </SheetContent>
     </Sheet>
