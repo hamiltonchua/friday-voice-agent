@@ -509,3 +509,172 @@ header h1 { font-size: 1.5rem; font-weight: 600; }
 @media (max-width: 480px) {
   .msg { max-width: 92%; }
 }
+
+/* =====================================================
+   Phase 9 — Two-panel layout additions
+   ===================================================== */
+
+/* Streaming cursor blink */
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Meeting mode left accent bar pulse */
+@keyframes meeting-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+/* Audio level ring for new panel layout */
+.audio-ring {
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  pointer-events: none;
+  transition: border-color 0.05s, box-shadow 0.05s;
+}
+.audio-ring.active {
+  border-color: rgba(0, 217, 126, 0.6);
+}
+
+/* Mic button states — new class names for left panel */
+.mic-btn {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(233, 69, 96, 0.4);
+  position: relative;
+  transition: transform 0.15s, box-shadow 0.15s, background 0.3s;
+}
+.mic-btn:hover { transform: scale(1.05); }
+.mic-btn:active { transform: scale(0.95); }
+
+.mic-btn.recording {
+  animation: pulse 1.5s infinite;
+  background: #ff2244;
+}
+.mic-btn.vad-active {
+  background: var(--green);
+}
+.mic-btn.vad-active.recording {
+  animation: pulse-green 1.5s infinite;
+  background: #00ff99;
+}
+.mic-btn.sleeping {
+  background: var(--purple);
+  animation: pulse-sleep 3s infinite;
+}
+
+/* Secondary control buttons */
+.ctrl-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  color: var(--text2);
+  transition: transform 0.15s, background 0.2s;
+}
+.ctrl-btn:hover { transform: scale(1.05); background: var(--accent2); color: var(--text); }
+.ctrl-btn:active { transform: scale(0.95); }
+.ctrl-btn.wake-active { background: var(--purple); color: white; }
+.ctrl-btn.meeting-active { background: var(--accent); color: white; }
+
+/* Message row style (new, replaces bubble style) */
+.msg-row {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 16px;
+  border-left: 3px solid transparent;
+  line-height: 1.5;
+  font-size: 0.95rem;
+  transition: border-color 0.2s;
+}
+.msg-row.assistant { border-left-color: var(--accent); }
+.msg-row.user { border-left-color: #0f3460; }
+.msg-row.system { border-left-color: rgba(255,255,255,0.1); }
+.msg-row .role-label {
+  font-size: 0.7rem;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 3px;
+}
+.msg-row .msg-text { color: var(--text); }
+.msg-row.streaming { border-left-color: var(--accent); }
+.msg-row.streaming .msg-text::after {
+  content: '▋';
+  animation: cursor-blink 1s infinite;
+  color: var(--accent);
+}
+.msg-row.interrupted { opacity: 0.5; font-style: italic; }
+.msg-row.rejected { opacity: 0.4; border-left-color: var(--accent); }
+.msg-row .msg-meta {
+  font-size: 0.7rem;
+  color: var(--text2);
+  margin-top: 4px;
+}
+
+/* Meeting entry row */
+.meeting-row {
+  padding: 4px 16px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.meeting-row .meeting-time { color: var(--text2); font-size: 0.7rem; }
+.meeting-row .meeting-speaker { font-weight: 600; }
+.meeting-row .meeting-speaker.ham { color: var(--green); }
+.meeting-row .meeting-speaker.other { color: #0f3460; }
+.meeting-row .meeting-speaker.kismet { color: var(--accent); }
+
+/* Connection dot */
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  transition: background 0.3s;
+}
+.conn-dot.connected { background: var(--green); }
+.conn-dot.disconnected { background: var(--accent); }
+.conn-dot.sleeping { background: var(--purple); }
+.conn-dot.connecting { background: var(--text2); animation: pulse-sleep 2s infinite; }
+
+/* Status text colors (reuse existing, now inline) */
+.status-active { color: var(--green); }
+.status-listening { color: var(--accent); }
+.status-sleeping { color: var(--purple); }
+.status-default { color: var(--text2); }
+
+/* Mobile bottom dock */
+@media (max-width: 767px) {
+  .mobile-dock {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(transparent, var(--bg) 20%);
+    padding: 16px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 16px;
+    z-index: 40;
+  }
+}
