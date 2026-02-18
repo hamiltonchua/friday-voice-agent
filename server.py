@@ -23,6 +23,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from platform_config import (
     PLATFORM, STT_BACKEND, TTS_BACKEND,
@@ -534,10 +535,20 @@ async def shutdown_event():
         wake_word_model = None
 
 
+# Serve React build output (frontend/dist/)
+_DIST_DIR = Path(__file__).parent / "frontend" / "dist"
+_DIST_INDEX = _DIST_DIR / "index.html"
+_FALLBACK_HTML = Path(__file__).parent / "index.html"
+
+if _DIST_DIR.exists() and (_DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(_DIST_DIR / "assets")), name="assets")
+
+
 @app.get("/")
 async def index():
-    html_path = Path(__file__).parent / "index.html"
-    return HTMLResponse(html_path.read_text())
+    if _DIST_INDEX.exists():
+        return HTMLResponse(_DIST_INDEX.read_text())
+    return HTMLResponse(_FALLBACK_HTML.read_text())
 
 
 @app.websocket("/ws")
