@@ -18,27 +18,37 @@ export function ChatDisplay({ messages, meetingEntries, meetingMode }: ChatDispl
   }, [messages, meetingEntries])
 
   return (
-    <div id="chat" ref={chatRef}>
+    <div
+      ref={chatRef}
+      style={{
+        flex: 1,
+        overflowY: 'auto',
+        paddingBottom: 32,
+        scrollBehavior: 'smooth',
+      }}
+    >
       {messages.map(msg => (
         <div
           key={msg.id}
           className={[
-            'msg',
+            'msg-row',
             msg.role,
             msg.streaming ? 'streaming' : '',
             msg.interrupted ? 'interrupted' : '',
             msg.rejected ? 'rejected' : '',
           ].filter(Boolean).join(' ')}
         >
-          {msg.text}
-          {msg.meta && <div className="meta">{msg.meta}</div>}
+          <span className="role-label">{msg.role}</span>
+          <span className="msg-text">{msg.text}</span>
+          {msg.meta && <div className="msg-meta">{msg.meta}</div>}
         </div>
       ))}
+
       {meetingMode && meetingEntries.map(entry => (
-        <div key={entry.id} className="meeting-entry">
-          <span className="timestamp">{entry.time}</span>
-          <span className={`speaker ${entry.speakerType}`}>{entry.speaker}:</span>
-          {' '}{entry.text}
+        <div key={entry.id} className="meeting-row">
+          <span className="meeting-time">{entry.time}</span>
+          <span className={`meeting-speaker ${entry.speakerType}`}>{entry.speaker}:</span>
+          <span style={{ color: 'var(--text)', flex: 1 }}>{entry.text}</span>
         </div>
       ))}
     </div>
