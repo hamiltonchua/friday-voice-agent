@@ -650,11 +650,9 @@ async def websocket_endpoint(ws: WebSocket):
                     if score < speaker_verify.DEFAULT_THRESHOLD:
                         print(f"[Speaker] Rejected: score={score:.3f} ({sv_time:.2f}s)")
                         await ws.send_json({"type": "rejected", "score": round(float(score), 3), "time": round(sv_time, 2)})
-                        # If wake word mode, go back to sleep
-                        if WAKE_WORD_ENABLED and client_state == "awake":
-                            client_state = "sleeping"
-                            print("[State] Rejected speaker, going back to sleep")
-                            await ws.send_json({"type": "sleep"})
+                        # Stay awake so user can retry without wake word
+                        # Reset idle timer instead of going back to sleep
+                        last_activity = time.time()
                         return
                     print(f"[Speaker] Verified: score={score:.3f} ({sv_time:.2f}s)")
                     # Pass score along for UI display

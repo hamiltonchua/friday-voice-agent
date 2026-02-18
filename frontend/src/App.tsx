@@ -437,6 +437,24 @@ export default function App() {
         meta: `Score: ${msg.score} · ${msg.time}s`,
         rejected: true,
       }])
+      // Subtle double-beep so user knows (even when tab is in background)
+      try {
+        const actx = new AudioContext()
+        const playTone = (freq: number, startTime: number, duration: number) => {
+          const osc = actx.createOscillator()
+          const gain = actx.createGain()
+          osc.type = 'sine'
+          osc.frequency.value = freq
+          gain.gain.setValueAtTime(0.08, startTime)
+          gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration)
+          osc.connect(gain).connect(actx.destination)
+          osc.start(startTime)
+          osc.stop(startTime + duration)
+        }
+        playTone(440, actx.currentTime, 0.12)
+        playTone(330, actx.currentTime + 0.15, 0.12)
+        setTimeout(() => actx.close(), 500)
+      } catch (_) { /* ignore audio context errors */ }
       setIsProcessing(false)
       isProcessingRef.current = false
       updateStatusForMode()
