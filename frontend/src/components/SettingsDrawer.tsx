@@ -1,4 +1,5 @@
 // frontend/src/components/SettingsDrawer.tsx
+import { useState } from 'react'
 import { Settings } from 'lucide-react'
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from './ui/sheet'
 import { ENROLL_MIN, ENROLL_MAX } from '../constants'
@@ -11,8 +12,16 @@ interface SettingsDrawerProps {
 }
 
 export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyToggle }: SettingsDrawerProps) {
+  const [open, setOpen] = useState(false)
+
+  const handleEnroll = () => {
+    setOpen(false)
+    // Delay to let Sheet close animation finish (300ms)
+    setTimeout(() => onEnroll(), 350)
+  }
+
   return (
-    <Sheet>
+    <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <button
           className="ctrl-btn"
@@ -37,7 +46,7 @@ export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyTogg
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <button
                 className="ctrl-btn"
-                onClick={onEnroll}
+                onClick={handleEnroll}
                 title="Enroll your voice for speaker verification"
                 style={{ width: '100%', borderRadius: 8, height: 40, fontSize: '0.85rem', color: 'var(--text2)', background: 'var(--surface2)', border: 'none', cursor: 'pointer', padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8 }}
               >

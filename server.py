@@ -313,6 +313,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                     "messages": messages,
                     "user": "voice-chat",
                     "stream": True,
+                    "thinking": {"type": "disabled"},
                 },
                 timeout=120.0,
             ) as response:

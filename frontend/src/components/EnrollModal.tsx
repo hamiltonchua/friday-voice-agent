@@ -69,6 +69,10 @@ export function EnrollModal({ show, step, onCancel, send }: EnrollModalProps) {
     }
   }, [show, step, send])
 
+  const handleFinish = useCallback(() => {
+    send({ type: 'enroll_complete' })
+  }, [send])
+
   if (!show) return null
 
   const isDone = step >= ENROLL_MAX
@@ -77,10 +81,6 @@ export function EnrollModal({ show, step, onCancel, send }: EnrollModalProps) {
   const infoText = isDone ? '' : step < ENROLL_MIN
     ? `Sample ${step + 1} of ${ENROLL_MIN} required (up to ${ENROLL_MAX})`
     : `Sample ${step + 1} of ${ENROLL_MAX} — ${step} recorded, you can finish or keep going`
-
-  const handleFinish = useCallback(() => {
-    send({ type: 'enroll_complete' })
-  }, [send])
 
   return (
     <div className="modal-overlay show">
