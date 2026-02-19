@@ -8,7 +8,7 @@ Built by [Kismet Labs](https://kismetlabs.com), an AI consulting firm in the Phi
 
 ```
 Browser (mic) → WebSocket → Server
-                              ├─ Wake Word: OpenWakeWord (CPU)
+                              ├─ Wake Word: Porcupine (CPU, "Hey Friday")
                               ├─ Speaker Verification: SpeechBrain ECAPA-TDNN (CPU)
                               ├─ STT: faster-whisper large-v3 (GPU)
                               ├─ LLM: OpenClaw /v1/chat/completions → your agent
@@ -20,7 +20,7 @@ Everything except the LLM runs locally on your machine. No cloud STT/TTS APIs, n
 
 ## Features
 
-- **Wake Word** — say "Hey Jarvis" to activate (OpenWakeWord, runs on CPU)
+- **Wake Word** — say "Hey Friday" to activate (Picovoice Porcupine, runs on CPU)
 - **Speaker Verification** — only responds to enrolled voices (SpeechBrain ECAPA-TDNN)
 - **Streaming TTS** — responses spoken sentence-by-sentence as they arrive
 - **Voice Activity Detection (VAD)** — hands-free, no button required
@@ -28,26 +28,23 @@ Everything except the LLM runs locally on your machine. No cloud STT/TTS APIs, n
 - **Voice Cloning** — Chatterbox TTS supports cloning from a reference audio file
 - **Auto-Reconnection** — WebSocket reconnects with exponential backoff
 - **Audio Level Visualizer** — mic input levels shown on the mic button
+- **Settings Drawer** — configure speaker verification and voice enrollment in-app
 - **Local processing** — STT, TTS, wake word, and speaker verify all run locally
 
 ## Requirements
 
 - **GPU:** NVIDIA with 6GB+ VRAM (tested on RTX 3060 12GB)
 - **Python 3.11** (required for Chatterbox TTS)
+- **Node.js 18+** (for frontend development)
 - **OpenClaw** with chat completions endpoint enabled
 - **CUDA** toolkit installed
 - **conda** (recommended for environment management)
+- **Picovoice Porcupine access key** (free tier available at [picovoice.ai](https://picovoice.ai))
 
 ### Python Dependencies
 
 ```bash
 pip install -r requirements.txt
-```
-
-Or manually:
-
-```bash
-pip install faster-whisper fastapi uvicorn numpy httpx chatterbox-tts speechbrain openwakeword
 ```
 
 ### Optional: Kokoro TTS (lighter alternative)
@@ -86,6 +83,30 @@ Browsers require HTTPS to access the microphone over a network. Generate a self-
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
 ```
 
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in your values:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TTS_ENGINE` | `chatterbox` | TTS engine (`chatterbox` or `kokoro`) |
+| `CHATTERBOX_REF` | — | Reference audio for voice cloning |
+| `WHISPER_MODEL` | `large-v3` | Whisper model size |
+| `WHISPER_DEVICE` | `cuda` | Device for STT (`cuda`, `cpu`) |
+| `KOKORO_VOICE` | `af_heart` | Kokoro voice ID (when using Kokoro) |
+| `WAKE_WORD_ENABLED` | `true` | Enable wake word detection |
+| `WAKE_WORD` | `hey_friday` | Wake word (must match your `.ppn` model) |
+| `PORCUPINE_ACCESS_KEY` | — | Picovoice Porcupine access key (required) |
+| `PORCUPINE_MODEL_PATH` | — | Path to custom `.ppn` wake word file |
+| `WAKE_WORD_THRESHOLD` | `0.5` | Wake word detection sensitivity |
+| `SPEAKER_VERIFY` | `auto` | Speaker verification (`auto`, `true`, `false`) |
+| `SPEAKER_VERIFY_THRESHOLD` | `0.65` | Cosine similarity threshold |
+| `IDLE_TIMEOUT_SEC` | `30` | Seconds before returning to sleep |
+| `OPENCLAW_URL` | `http://127.0.0.1:18789/v1/chat/completions` | OpenClaw endpoint |
+| `OPENCLAW_TOKEN` | — | Gateway auth token |
+| `OPENCLAW_AGENT` | `main` | Agent ID to route to |
+| `SYSTEM_PROMPT` | *(built-in)* | System prompt for voice responses |
+
 ## Usage
 
 ### Quick Start (with Chatterbox TTS)
@@ -97,45 +118,83 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ### Quick Start (with Kokoro TTS)
 
 ```bash
-./start.sh
+./start-kokoro.sh
 ```
 
 Open `https://<your-host>:8765` in your browser. Accept the self-signed cert warning.
 
 **Controls:**
-- **Wake word** — say "Hey Jarvis" to activate (when wake word mode is on)
+- **Wake word** — say "Hey Friday" to activate (when wake word mode is on)
 - **Eye button** — toggle VAD (auto-listen mode)
 - **Mic button** — hold to talk (manual mode), glows green to show audio levels
 - **Spacebar** — hold to talk (when VAD is off)
 - **Talk while Kismet speaks** — interrupts and listens to you
-- **Enroll Voice** — register your voice for speaker verification
+- **Settings (⚙️)** — open the settings drawer to manage speaker verification and enrollment
 
 ### Speaker Enrollment
 
-1. Click "Enroll Voice" in the header
-2. Record 3 guided sentences (hold to record each one)
-3. Your voice embedding is saved to `~/.kismet/voices/`
-4. Kismet will now only respond to your voice
+1. Click the **⚙️ settings icon** in the header to open the settings drawer
+2. Click **Enroll Voice**
+3. Record 3 guided sentences (hold to record each one)
+4. Your voice embedding is saved to `~/.kismet/voices/`
+5. Kismet will now only respond to your voice
 
-### Configuration
+You can toggle speaker verification on/off from the settings drawer at any time.
 
-| Variable | Default | Description |
-|---|---|---|
-| `TTS_ENGINE` | `chatterbox` | TTS engine (`chatterbox` or `kokoro`) |
-| `CHATTERBOX_REF` | — | Reference audio for voice cloning |
-| `WHISPER_MODEL` | `large-v3` | Whisper model size |
-| `WHISPER_DEVICE` | `cuda` | Device for STT (`cuda`, `cpu`) |
-| `KOKORO_VOICE` | `af_heart` | Kokoro voice ID (when using Kokoro) |
-| `WAKE_WORD_ENABLED` | `true` | Enable wake word detection |
-| `WAKE_WORD_MODEL` | `hey_jarvis` | Wake word model name |
-| `WAKE_WORD_THRESHOLD` | `0.5` | Wake word detection threshold |
-| `SPEAKER_VERIFY` | `auto` | Speaker verification (`auto`, `true`, `false`) |
-| `SPEAKER_VERIFY_THRESHOLD` | `0.65` | Cosine similarity threshold |
-| `IDLE_TIMEOUT_SEC` | `30` | Seconds before returning to sleep |
-| `OPENCLAW_URL` | `http://127.0.0.1:18789/v1/chat/completions` | OpenClaw endpoint |
-| `OPENCLAW_TOKEN` | — | Gateway auth token |
-| `OPENCLAW_AGENT` | `main` | Agent ID to route to |
-| `SYSTEM_PROMPT` | *(built-in)* | System prompt for voice responses |
+## Frontend
+
+The UI is a React 19 + TypeScript app built with Vite, Tailwind CSS, and [shadcn/ui](https://ui.shadcn.com/) components.
+
+### Stack
+
+| Layer | Library |
+|---|---|
+| Framework | React 19 + TypeScript |
+| Build | Vite |
+| Styling | Tailwind CSS v4 |
+| UI Components | shadcn/ui (Radix UI primitives) |
+| Icons | Lucide React |
+| VAD | @ricky0123/vad-web (Silero VAD, ONNX) |
+| Toasts | Sonner |
+
+### Structure
+
+```
+frontend/
+├── src/
+│   ├── App.tsx              # Root component + state machine
+│   ├── types.ts             # Shared TypeScript types
+│   ├── constants.ts         # Enrollment constants (min/max samples)
+│   ├── hooks/
+│   │   ├── useWebSocket.ts  # WebSocket connection + reconnect logic
+│   │   ├── useAudio.ts      # Audio playback queue
+│   │   ├── useAudioLevel.ts # Mic level visualizer
+│   │   ├── useVAD.ts        # Silero VAD integration
+│   │   ├── useManualRecording.ts  # Push-to-talk recording
+│   │   └── useWakeWordStream.ts   # Audio streaming to server for wake word
+│   └── components/
+│       ├── Header.tsx       # App header with title and settings trigger
+│       ├── StatusDisplay.tsx # Connection + agent state badges
+│       ├── ChatDisplay.tsx  # Conversation transcript
+│       ├── Controls.tsx     # Mic, VAD, and spacebar controls
+│       ├── EnrollModal.tsx  # Guided voice enrollment flow
+│       ├── SettingsDrawer.tsx  # Settings panel (shadcn Sheet)
+│       ├── MeetingBanner.tsx   # Meeting companion mode banner
+│       ├── ReconnectBanner.tsx # WebSocket reconnect status
+│       └── ui/              # shadcn/ui primitives (Sheet, etc.)
+```
+
+### Development
+
+```bash
+cd frontend
+npm install
+npm run dev        # Dev server at http://localhost:5173
+npm run build      # Production build → ../index.html + assets
+npm run lint       # ESLint
+```
+
+The production build outputs directly to the root of the project so `server.py` can serve it.
 
 ## VRAM Usage
 
@@ -145,7 +204,7 @@ Open `https://<your-host>:8765` in your browser. Accept the self-signed cert war
 | Chatterbox Turbo | ~2 GB |
 | **Total** | **~5 GB** |
 
-Wake word (OpenWakeWord) and speaker verification (SpeechBrain) run on CPU.
+Wake word (Porcupine) and speaker verification (SpeechBrain) run on CPU.
 
 Use `TTS_ENGINE=kokoro` (~300MB) or `WHISPER_MODEL=medium` (~1.5GB) to reduce VRAM.
 
@@ -156,11 +215,12 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan:
 - [x] **Phase 1:** Streaming TTS
 - [x] **Phase 2:** Voice Activity Detection (VAD)
 - [x] **Phase 3:** Interruption support
-- [x] **Phase 4:** Wake word ("Hey Jarvis")
-- [x] **Phase 5:** Speaker verification
+- [x] **Phase 4:** Wake word ("Hey Friday" via Porcupine)
+- [x] **Phase 5:** Speaker verification (SpeechBrain ECAPA-TDNN)
 - [x] **Phase 6:** Wake word + speaker verification combined
-- [ ] **Phase 7:** Polish & hardening (in progress)
-- [ ] **Phase 8:** Meeting companion (diarization)
+- [x] **Phase 7:** Polish & hardening (reconnection, toasts, audio visualizer)
+- [x] **Phase 8:** Meeting companion (passive transcription, diarization basics)
+- [ ] **Phase 9:** UI overhaul (settings drawer, mobile layout, visual polish) ← *in progress*
 
 ## License
 
