@@ -89,6 +89,25 @@ MEETING_SYSTEM_PROMPT = os.getenv("MEETING_SYSTEM_PROMPT", (
     "Keep responses concise and conversational. Plain spoken English only."
 ))
 
+CANVAS_INSTRUCTION = (
+    "\n\n## CANVAS OUTPUT (IMPORTANT)\n"
+    "You have a visual canvas display connected. When your response includes data that benefits from "
+    "visual presentation (tables, charts, comparisons, code, lists, structured info), you MUST include "
+    "a <canvas> block in your response. The canvas content is rendered visually on a separate screen — "
+    "it is NOT spoken aloud. Always speak a brief summary AND include the canvas block.\n\n"
+    "Two formats:\n"
+    '1. Rich HTML: <canvas type="html" title="Title">...HTML content...</canvas>\n'
+    '2. Plain text: <canvas type="text" title="Title">...text content...</canvas>\n\n'
+    "For charts, include: <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n\n"
+    "Example response:\n"
+    "Here's the comparison you asked for.\n"
+    '<canvas type="html" title="Python vs JavaScript">\n'
+    "<table><tr><th>Feature</th><th>Python</th><th>JavaScript</th></tr>\n"
+    "<tr><td>Typing</td><td>Dynamic</td><td>Dynamic</td></tr></table>\n"
+    "</canvas>\n\n"
+    "ALWAYS use canvas blocks for visual data. Do NOT describe tables/charts verbally — show them on canvas."
+)
+
 # ---------------------------------------------------------------------------
 # Global singletons
 # ---------------------------------------------------------------------------
@@ -274,13 +293,52 @@ def detect_wake_word(audio_chunk: np.ndarray) -> tuple[bool, float]:
 # Sentence boundary pattern: ends with .!? followed by space or end
 SENTENCE_END_RE = re.compile(r'[.!?](?:\s|$)')
 
+# Canvas block extraction
+CANVAS_BLOCK_RE = re.compile(r'<canvas\s+type="(\w+)"(?:\s+title="([^"]*)")?\s*>(.*?)</canvas>', re.DOTALL)
 
-async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncIterator[tuple[str, str]]:
+
+def extract_canvas_blocks(text: str) -> tuple[str, list[dict]]:
+    """Extract <canvas> blocks from text. Returns (cleaned_text, blocks)."""
+    blocks = []
+    for m in CANVAS_BLOCK_RE.finditer(text):
+        blocks.append({
+            "type": m.group(1),
+            "title": m.group(2) or "",
+            "content": m.group(3).strip(),
+        })
+    cleaned = CANVAS_BLOCK_RE.sub("", text).strip()
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned, blocks
+
+
+# Connected canvas display clients
+_canvas_clients: set[WebSocket] = set()
+
+
+async def push_canvas(blocks: list[dict], loop):
+    """Push canvas blocks to connected canvas display clients via WebSocket."""
+    if not _canvas_clients:
+        print("[Canvas] No canvas clients connected, skipping push")
+        return
+    for block in blocks:
+        msg = json.dumps({"type": "canvas_update", "block": block})
+        dead = set()
+        for client in _canvas_clients:
+            try:
+                await client.send_text(msg)
+            except Exception:
+                dead.add(client)
+        _canvas_clients.difference_update(dead)
+        print(f"[Canvas] Pushed {block['type']}: {block['title'] or '(untitled)'} to {len(_canvas_clients)} client(s)")
+
+
+async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt: str | None = None) -> AsyncIterator[tuple[str, str]]:
     """
     Stream chat response from OpenClaw.
     Yields tuples of (event_type, data):
       - ("token", token_text) for each token
       - ("sentence", sentence_text) for each complete sentence
+      - ("working", "") when tools are likely running (>2s before first token)
       - ("done", full_text) when finished
       - ("cancelled", partial_text) when interrupted
     """
@@ -292,11 +350,14 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
     if len(conversation_history) > 40:
         conversation_history = conversation_history[-40:]
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+    messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}] + conversation_history
 
     full_text = ""
     buffer = ""
     cancelled = False
+    got_first_token = False
+    working_emitted = False
+    request_start = time.time()
 
     try:
         async with httpx.AsyncClient() as client:
@@ -326,6 +387,12 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                         print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
                         break
 
+                    # Detect tool usage: >2s without content tokens
+                    if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
+                        working_emitted = True
+                        print("[LLM] Tools likely running (>2s before first token)")
+                        yield ("working", "")
+
                     if not line.startswith("data: "):
                         continue
 
@@ -339,6 +406,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                         token = delta.get("content", "")
 
                         if token:
+                            got_first_token = True
                             full_text += token
                             buffer += token
                             yield ("token", token)
@@ -564,6 +632,95 @@ async def index():
         return HTMLResponse(_DIST_INDEX.read_text())
     return HTMLResponse(_FALLBACK_HTML.read_text())
 
+CANVAS_PAGE = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kismet Canvas</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 24px; line-height: 1.6; min-height: 100vh; }
+  h1, h2, h3 { color: #ffffff; margin-bottom: 12px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #333; padding: 10px 14px; text-align: left; }
+  th { background: #16213e; color: #00d97e; }
+  tr:nth-child(even) { background: rgba(255,255,255,0.03); }
+  code, pre { background: #0f0f0f; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  pre { padding: 16px; overflow-x: auto; margin: 12px 0; }
+  canvas { max-width: 100%; }
+  #status { position: fixed; top: 12px; right: 16px; font-size: 0.75rem; color: #666; }
+  #status.connected { color: #00d97e; }
+  #content { max-width: 900px; margin: 0 auto; }
+  .canvas-block { margin-bottom: 24px; animation: fadeIn 0.3s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .empty { display: flex; align-items: center; justify-content: center; height: 80vh; color: #555; font-size: 1.1rem; }
+</style>
+</head><body>
+<div id="status">disconnected</div>
+<div id="content">
+  <div class="empty" id="placeholder">Waiting for canvas content...</div>
+</div>
+<script>
+const content = document.getElementById('content');
+const status = document.getElementById('status');
+const placeholder = document.getElementById('placeholder');
+let ws;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/canvas`);
+  ws.onopen = () => { status.textContent = 'connected'; status.className = 'connected'; };
+  ws.onclose = () => { status.textContent = 'disconnected'; status.className = ''; setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'canvas_update') {
+      if (placeholder) placeholder.remove();
+      const block = msg.block;
+      const div = document.createElement('div');
+      div.className = 'canvas-block';
+      if (block.type === 'html') {
+        div.innerHTML = (block.title ? '<h2>' + block.title + '</h2>' : '') + block.content;
+        // Execute any script tags in the HTML content
+        div.querySelectorAll('script').forEach(old => {
+          const s = document.createElement('script');
+          s.textContent = old.textContent;
+          old.replaceWith(s);
+        });
+      } else {
+        div.innerHTML = (block.title ? '<h2>' + block.title + '</h2>' : '') + '<pre>' + block.content.replace(/</g,'&lt;') + '</pre>';
+      }
+      content.innerHTML = '';
+      content.appendChild(div);
+    }
+  };
+}
+connect();
+</script>
+</body></html>"""
+
+
+@app.get("/canvas")
+async def canvas_page():
+    return HTMLResponse(CANVAS_PAGE)
+
+
+@app.websocket("/ws/canvas")
+async def canvas_ws(ws: WebSocket):
+    await ws.accept()
+    _canvas_clients.add(ws)
+    print(f"[Canvas] Display client connected ({len(_canvas_clients)} total)")
+    try:
+        while True:
+            await ws.receive_text()  # keep alive, ignore messages
+    except Exception:
+        pass
+    finally:
+        _canvas_clients.discard(ws)
+        print(f"[Canvas] Display client disconnected ({len(_canvas_clients)} total)")
+
+
 @app.get("/{filename:path}")
 async def serve_static(filename: str):
     """Serve static files from frontend/dist/ (e.g. .onnx, .wasm, .svg)"""
@@ -632,6 +789,9 @@ async def websocket_endpoint(ws: WebSocket):
     # Enrollment session state
     enrollment_samples = []
     enrolling = False
+
+    # Canvas state (per-connection)
+    canvas_enabled = False
 
     async def process_audio(audio_bytes: bytes):
         nonlocal cancel_event, last_activity, client_state
@@ -741,11 +901,33 @@ async def websocket_endpoint(ws: WebSocket):
         total_tts_time = 0
         llm_error = False
 
-        async for event_type, data in chat_stream(user_text, cancel_event):
+        effective_prompt = SYSTEM_PROMPT + CANVAS_INSTRUCTION if canvas_enabled else SYSTEM_PROMPT
+        in_canvas_block = False  # Track if we're inside a <canvas> block
+        canvas_token_buf = ""    # Buffer tokens while inside canvas block
+
+        async for event_type, data in chat_stream(user_text, cancel_event, effective_prompt):
             if cancel_event.is_set() and event_type not in ("cancelled", "done"):
                 continue
 
-            if event_type == "token":
+            if event_type == "working":
+                await ws.send_json({"type": "working"})
+
+            elif event_type == "token":
+                if canvas_enabled:
+                    canvas_token_buf += data
+                    # Detect entering canvas block
+                    if not in_canvas_block and '<canvas' in canvas_token_buf:
+                        in_canvas_block = True
+                    # Detect leaving canvas block
+                    if in_canvas_block and '</canvas>' in canvas_token_buf:
+                        in_canvas_block = False
+                        canvas_token_buf = ""
+                        continue
+                    # Suppress tokens while inside canvas block
+                    if in_canvas_block:
+                        continue
+                    # Not in canvas block — flush and send
+                    canvas_token_buf = ""
                 await ws.send_json({"type": "token", "text": data})
 
             elif event_type == "sentence":
@@ -754,6 +936,10 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Check cancellation before TTS
                 if cancel_event.is_set():
+                    continue
+
+                # Skip TTS for any sentence with canvas markup or while in canvas block
+                if canvas_enabled and ('<canvas' in data or '</canvas>' in data or in_canvas_block):
                     continue
 
                 await ws.send_json({"type": "status", "text": "Speaking..."})
@@ -790,6 +976,16 @@ async def websocket_endpoint(ws: WebSocket):
                 return
 
             elif event_type == "done":
+                # Extract and push canvas blocks if enabled
+                if canvas_enabled and '<canvas' in data:
+                    cleaned_text, canvas_blocks = extract_canvas_blocks(data)
+                    if conversation_history and conversation_history[-1]["role"] == "assistant":
+                        conversation_history[-1]["content"] = cleaned_text
+                    if canvas_blocks:
+                        asyncio.create_task(push_canvas(canvas_blocks, loop))
+                        await ws.send_json({"type": "canvas_pushed", "count": len(canvas_blocks)})
+                    data = cleaned_text
+
                 llm_time = time.time() - llm_start
                 last_activity = time.time()
                 await ws.send_json({
@@ -1054,6 +1250,11 @@ async def websocket_endpoint(ws: WebSocket):
                 global SPEAKER_VERIFY
                 SPEAKER_VERIFY = "true" if msg.get("enabled") else "false"
                 await ws.send_json({"type": "verify_toggled", "enabled": msg.get("enabled", False)})
+
+            elif msg["type"] == "canvas_toggle":
+                canvas_enabled = msg.get("enabled", False)
+                print(f"[Canvas] {'Enabled' if canvas_enabled else 'Disabled'}")
+                await ws.send_json({"type": "canvas_toggled", "enabled": canvas_enabled})
 
             elif msg["type"] == "meeting_start":
                 # Start meeting companion mode

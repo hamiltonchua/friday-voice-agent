@@ -8,12 +8,13 @@ interface HeaderProps {
   meetingMode: boolean
   enrolled: boolean
   verifyEnabled: boolean
+  canvasEnabled: boolean
   onEnroll: () => void
   onVerifyToggle: () => void
   onMeetingToggle: () => void
 }
 
-export function Header({ statusText, statusClass, connectionDot, meetingMode, enrolled, verifyEnabled, onEnroll, onVerifyToggle, onMeetingToggle }: HeaderProps) {
+export function Header({ statusText, statusClass, connectionDot, meetingMode, enrolled, verifyEnabled, canvasEnabled, onEnroll, onVerifyToggle, onMeetingToggle }: HeaderProps) {
   // Mobile-only top bar — hidden on desktop (md+)
   return (
     <header
@@ -24,9 +25,14 @@ export function Header({ statusText, statusClass, connectionDot, meetingMode, en
         borderBottom: '1px solid rgba(255,255,255,0.08)',
       }}
     >
-      <h1 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Kismet</h1>
+      <h1 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Kismet Labs</h1>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className={`conn-dot ${connectionDot}`} />
+        {canvasEnabled && (
+          <span style={{ fontSize: '0.6rem', background: 'var(--purple)', color: 'white', padding: '1px 5px', borderRadius: 4, fontWeight: 600 }}>
+            CANVAS
+          </span>
+        )}
         <span
           className={`status-${statusClass || 'default'}`}
           style={{ fontSize: '0.8rem' }}

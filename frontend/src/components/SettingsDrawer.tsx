@@ -7,11 +7,13 @@ import { ENROLL_MIN, ENROLL_MAX } from '../constants'
 interface SettingsDrawerProps {
   enrolled: boolean
   verifyEnabled: boolean
+  canvasEnabled: boolean
   onEnroll: () => void
   onVerifyToggle: () => void
+  onCanvasToggle: () => void
 }
 
-export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyToggle }: SettingsDrawerProps) {
+export function SettingsDrawer({ enrolled, verifyEnabled, canvasEnabled, onEnroll, onVerifyToggle, onCanvasToggle }: SettingsDrawerProps) {
   const [open, setOpen] = useState(false)
 
   const handleEnroll = () => {
@@ -90,6 +92,48 @@ export function SettingsDrawer({ enrolled, verifyEnabled, onEnroll, onVerifyTogg
               {enrolled
                 ? `Enrolled. Verification is ${verifyEnabled ? 'on' : 'off'}.`
                 : `Not enrolled. Record ${ENROLL_MIN}–${ENROLL_MAX} voice samples to enable speaker verification.`}
+            </p>
+          </div>
+
+          {/* Canvas Output */}
+          <div>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 12 }}>
+              Canvas Output
+            </p>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--surface2)', borderRadius: 8 }}>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text2)' }}>Canvas Display</span>
+              <button
+                onClick={onCanvasToggle}
+                style={{
+                  width: 40,
+                  height: 22,
+                  borderRadius: 11,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: canvasEnabled ? 'var(--green)' : 'var(--surface)',
+                  position: 'relative',
+                  transition: 'background 0.2s',
+                }}
+                title="Toggle canvas output"
+              >
+                <span style={{
+                  position: 'absolute',
+                  top: 2,
+                  left: canvasEnabled ? 20 : 2,
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  background: 'white',
+                  transition: 'left 0.2s',
+                }} />
+              </button>
+            </div>
+
+            <p style={{ fontSize: '0.7rem', color: 'var(--text2)', marginTop: 8 }}>
+              {canvasEnabled
+                ? 'Canvas enabled. Visual content will be pushed to the a2ui panel.'
+                : 'Canvas disabled. Enable to allow visual output (charts, tables, code).'}
             </p>
           </div>
         </div>
