@@ -363,6 +363,9 @@ export default function App() {
         meta: metaParts.join(' · ') || undefined,
       }])
 
+    } else if (type === 'working') {
+      setStatus('Using tools...', 'active')
+
     } else if (type === 'stream_start') {
       streamingTextRef.current = ''
       const id = crypto.randomUUID()

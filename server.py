@@ -281,6 +281,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
     Yields tuples of (event_type, data):
       - ("token", token_text) for each token
       - ("sentence", sentence_text) for each complete sentence
+      - ("working", "") when tools are likely running (>2s before first token)
       - ("done", full_text) when finished
       - ("cancelled", partial_text) when interrupted
     """
@@ -297,6 +298,9 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
     full_text = ""
     buffer = ""
     cancelled = False
+    got_first_token = False
+    working_emitted = False
+    request_start = time.time()
 
     try:
         async with httpx.AsyncClient() as client:
@@ -326,6 +330,12 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                         print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
                         break
 
+                    # Detect tool usage: >2s without content tokens
+                    if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
+                        working_emitted = True
+                        print("[LLM] Tools likely running (>2s before first token)")
+                        yield ("working", "")
+
                     if not line.startswith("data: "):
                         continue
 
@@ -339,6 +349,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event) -> AsyncItera
                         token = delta.get("content", "")
 
                         if token:
+                            got_first_token = True
                             full_text += token
                             buffer += token
                             yield ("token", token)
@@ -745,7 +756,10 @@ async def websocket_endpoint(ws: WebSocket):
             if cancel_event.is_set() and event_type not in ("cancelled", "done"):
                 continue
 
-            if event_type == "token":
+            if event_type == "working":
+                await ws.send_json({"type": "working"})
+
+            elif event_type == "token":
                 await ws.send_json({"type": "token", "text": data})
 
             elif event_type == "sentence":
