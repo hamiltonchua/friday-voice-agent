@@ -12,8 +12,9 @@ Browser (mic) → WebSocket → Server
                               ├─ Speaker Verification: SpeechBrain ECAPA-TDNN (CPU)
                               ├─ STT: MLX Whisper (macOS) / faster-whisper (CUDA)
                               ├─ LLM: OpenClaw /v1/chat/completions → your agent
-                              └─ TTS: MLX Kokoro/Chatterbox (macOS) / Chatterbox (CUDA) / Kokoro ONNX (CPU)
-                            ← audio response
+                              ├─ TTS: MLX Kokoro/Chatterbox (macOS) / Chatterbox (CUDA) / Kokoro ONNX (CPU)
+                              └─ Canvas: /canvas WebSocket → visual display panel
+                            ← audio response + canvas content
 ```
 
 Everything except the LLM runs locally on your machine. No cloud STT/TTS APIs, no extra costs.
@@ -42,6 +43,8 @@ Override auto-detection with `KISMET_PLATFORM=mlx|cuda|cpu` or set `STT_BACKEND`
 - **Audio Level Visualizer** — mic input levels shown on the mic button
 - **Settings Drawer** — configure speaker verification and voice enrollment in-app
 - **Speaker score display** — verification score shown on each user message
+- **Canvas Display** — visual output (charts, tables, code) pushed to a companion canvas page
+- **Tool Activity Indicator** — shows "Using tools..." when the LLM is running tools
 - **Local processing** — STT, TTS, wake word, and speaker verify all run locally
 
 ## Requirements
@@ -178,6 +181,25 @@ Open `https://<your-host>:8765` in your browser. Accept the self-signed cert war
 
 You can toggle speaker verification on/off from the settings drawer at any time. Each user message shows the verification score (e.g., `speaker ✓ 0.78`).
 
+## Canvas Display
+
+The voice agent includes a companion canvas page at `/canvas` for visual output. When the Canvas Output toggle is enabled in settings, the LLM can emit rich visual content (charts, tables, code, structured data) that appears on the canvas while the voice response speaks a brief summary.
+
+### Setup
+
+1. Open `https://<your-host>:8765/canvas` in a browser (or point a WebView at it)
+2. Toggle **Canvas Output** on in the voice agent settings drawer
+3. Ask something visual — "compare Python and JavaScript", "show me a chart", etc.
+
+The canvas page auto-reconnects via WebSocket. Canvas content is stripped from the spoken response — the LLM speaks a summary, the canvas shows the details.
+
+### How It Works
+
+- LLM emits `<canvas type="html">` or `<canvas type="text">` blocks in its response
+- Backend extracts canvas blocks, suppresses them from TTS and chat display
+- Canvas content is broadcast to connected `/ws/canvas` WebSocket clients
+- HTML canvas blocks support Chart.js, tables, styled content, and inline scripts
+
 ## Frontend
 
 The UI is a React 19 + TypeScript app built with Vite, Tailwind CSS, and [shadcn/ui](https://ui.shadcn.com/) components.
@@ -255,7 +277,7 @@ Wake word (Porcupine) and speaker verification (SpeechBrain) run on CPU on all p
 - [x] **Phase 6:** Wake word + speaker verification combined
 - [x] **Phase 7:** Polish & hardening (reconnection, toasts, audio visualizer)
 - [x] **Phase 9:** UI overhaul — React 19 + shadcn/ui rewrite, settings drawer, speaker score display
-- [ ] **Phase 10:** Tool call visibility — show active/completed tool calls in the UI
+- [x] **Phase 10:** Canvas display + tool activity — standalone canvas page via WebSocket, tool-working indicator, canvas token/TTS suppression
 - [ ] **Phase 11:** Token-aware context management — replace naive sliding window with token counting and compaction
 - [ ] **Phase 8:** Meeting companion — passive transcription with diarization, wake word commands *(parked)*
 
