@@ -90,13 +90,22 @@ MEETING_SYSTEM_PROMPT = os.getenv("MEETING_SYSTEM_PROMPT", (
 ))
 
 CANVAS_INSTRUCTION = (
-    "\n\nYou can emit visual content for a canvas display panel. "
-    "Wrap visual content in <canvas> tags. Two types:\n"
-    '- <canvas type="html" title="Title">...full HTML...</canvas> for rich content (charts, tables, styled output). '
-    "Include Chart.js from https://cdn.jsdelivr.net/npm/chart.js if needed for charts.\n"
-    '- <canvas type="text" title="Title">...plain text...</canvas> for simple text summaries.\n'
-    "Canvas content is displayed visually, NOT spoken aloud. Continue speaking normally outside canvas blocks. "
-    "Use canvas when data benefits from visual presentation (comparisons, lists, code, charts)."
+    "\n\n## CANVAS OUTPUT (IMPORTANT)\n"
+    "You have a visual canvas display connected. When your response includes data that benefits from "
+    "visual presentation (tables, charts, comparisons, code, lists, structured info), you MUST include "
+    "a <canvas> block in your response. The canvas content is rendered visually on a separate screen — "
+    "it is NOT spoken aloud. Always speak a brief summary AND include the canvas block.\n\n"
+    "Two formats:\n"
+    '1. Rich HTML: <canvas type="html" title="Title">...HTML content...</canvas>\n'
+    '2. Plain text: <canvas type="text" title="Title">...text content...</canvas>\n\n'
+    "For charts, include: <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n\n"
+    "Example response:\n"
+    "Here's the comparison you asked for.\n"
+    '<canvas type="html" title="Python vs JavaScript">\n'
+    "<table><tr><th>Feature</th><th>Python</th><th>JavaScript</th></tr>\n"
+    "<tr><td>Typing</td><td>Dynamic</td><td>Dynamic</td></tr></table>\n"
+    "</canvas>\n\n"
+    "ALWAYS use canvas blocks for visual data. Do NOT describe tables/charts verbally — show them on canvas."
 )
 
 # ---------------------------------------------------------------------------
@@ -893,6 +902,9 @@ async def websocket_endpoint(ws: WebSocket):
         llm_error = False
 
         effective_prompt = SYSTEM_PROMPT + CANVAS_INSTRUCTION if canvas_enabled else SYSTEM_PROMPT
+        in_canvas_block = False  # Track if we're inside a <canvas> block
+        canvas_token_buf = ""    # Buffer tokens while inside canvas block
+
         async for event_type, data in chat_stream(user_text, cancel_event, effective_prompt):
             if cancel_event.is_set() and event_type not in ("cancelled", "done"):
                 continue
@@ -901,6 +913,21 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "working"})
 
             elif event_type == "token":
+                if canvas_enabled:
+                    canvas_token_buf += data
+                    # Detect entering canvas block
+                    if not in_canvas_block and '<canvas' in canvas_token_buf:
+                        in_canvas_block = True
+                    # Detect leaving canvas block
+                    if in_canvas_block and '</canvas>' in canvas_token_buf:
+                        in_canvas_block = False
+                        canvas_token_buf = ""
+                        continue
+                    # Suppress tokens while inside canvas block
+                    if in_canvas_block:
+                        continue
+                    # Not in canvas block — flush and send
+                    canvas_token_buf = ""
                 await ws.send_json({"type": "token", "text": data})
 
             elif event_type == "sentence":
@@ -911,8 +938,8 @@ async def websocket_endpoint(ws: WebSocket):
                 if cancel_event.is_set():
                     continue
 
-                # Skip TTS for sentences containing canvas markup
-                if canvas_enabled and ('<canvas' in data or '</canvas>' in data):
+                # Skip TTS for any sentence with canvas markup or while in canvas block
+                if canvas_enabled and ('<canvas' in data or '</canvas>' in data or in_canvas_block):
                     continue
 
                 await ws.send_json({"type": "status", "text": "Speaking..."})
