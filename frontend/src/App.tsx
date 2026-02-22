@@ -684,7 +684,7 @@ export default function App() {
         >
           {/* Top: Title + status */}
           <div>
-            <h1 style={{ fontSize: '1.4rem', fontWeight: 700, marginBottom: 10 }}>Kismet</h1>
+            <h1 style={{ fontSize: '1.4rem', fontWeight: 700, marginBottom: 10 }}>Kismet Labs</h1>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span className={`conn-dot ${connectionDot}`} />
               {canvasEnabled && (

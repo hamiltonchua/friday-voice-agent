@@ -12,7 +12,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import tempfile
 import time
 import wave
@@ -303,52 +302,25 @@ def extract_canvas_blocks(text: str) -> tuple[str, list[dict]]:
     return cleaned, blocks
 
 
+# Connected canvas display clients
+_canvas_clients: set[WebSocket] = set()
+
+
 async def push_canvas(blocks: list[dict], loop):
-    """Push canvas blocks to macOS a2ui canvas via openclaw CLI."""
+    """Push canvas blocks to connected canvas display clients via WebSocket."""
+    if not _canvas_clients:
+        print("[Canvas] No canvas clients connected, skipping push")
+        return
     for block in blocks:
-        try:
-            if block["type"] == "text":
-                content = block["content"]
-                if block["title"]:
-                    content = f"{block['title']}\n\n{content}"
-                await loop.run_in_executor(None, lambda c=content: subprocess.run(
-                    ["openclaw", "nodes", "canvas", "a2ui", "push", "--node", "prodigy", "--text", c],
-                    timeout=10,
-                ))
-                print(f"[Canvas] Pushed text: {block['title'] or '(untitled)'}")
-            elif block["type"] == "html":
-                title = block["title"] or "Canvas"
-                html_content = f"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<title>{title}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 24px; line-height: 1.6; }}
-  h1, h2, h3 {{ color: #ffffff; margin-bottom: 12px; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 16px 0; }}
-  th, td {{ border: 1px solid #333; padding: 10px 14px; text-align: left; }}
-  th {{ background: #16213e; color: #00d97e; }}
-  tr:nth-child(even) {{ background: rgba(255,255,255,0.03); }}
-  code, pre {{ background: #0f0f0f; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }}
-  pre {{ padding: 16px; overflow-x: auto; margin: 12px 0; }}
-  canvas {{ max-width: 100%; }}
-</style>
-</head><body>
-<h2>{title}</h2>
-{block['content']}
-</body></html>"""
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, dir='/tmp', prefix='canvas_') as f:
-                    f.write(html_content)
-                    tmp_path = f.name
-                await loop.run_in_executor(None, lambda p=tmp_path: subprocess.run(
-                    ["openclaw", "nodes", "canvas", "navigate", "--node", "prodigy", "--url", f"file://{p}"],
-                    timeout=10,
-                ))
-                print(f"[Canvas] Pushed HTML to {tmp_path}")
-        except Exception as e:
-            print(f"[Canvas] Push error: {e}")
+        msg = json.dumps({"type": "canvas_update", "block": block})
+        dead = set()
+        for client in _canvas_clients:
+            try:
+                await client.send_text(msg)
+            except Exception:
+                dead.add(client)
+        _canvas_clients.difference_update(dead)
+        print(f"[Canvas] Pushed {block['type']}: {block['title'] or '(untitled)'} to {len(_canvas_clients)} client(s)")
 
 
 async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt: str | None = None) -> AsyncIterator[tuple[str, str]]:
@@ -650,6 +622,95 @@ async def index():
     if _DIST_INDEX.exists():
         return HTMLResponse(_DIST_INDEX.read_text())
     return HTMLResponse(_FALLBACK_HTML.read_text())
+
+CANVAS_PAGE = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kismet Canvas</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 24px; line-height: 1.6; min-height: 100vh; }
+  h1, h2, h3 { color: #ffffff; margin-bottom: 12px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #333; padding: 10px 14px; text-align: left; }
+  th { background: #16213e; color: #00d97e; }
+  tr:nth-child(even) { background: rgba(255,255,255,0.03); }
+  code, pre { background: #0f0f0f; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  pre { padding: 16px; overflow-x: auto; margin: 12px 0; }
+  canvas { max-width: 100%; }
+  #status { position: fixed; top: 12px; right: 16px; font-size: 0.75rem; color: #666; }
+  #status.connected { color: #00d97e; }
+  #content { max-width: 900px; margin: 0 auto; }
+  .canvas-block { margin-bottom: 24px; animation: fadeIn 0.3s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .empty { display: flex; align-items: center; justify-content: center; height: 80vh; color: #555; font-size: 1.1rem; }
+</style>
+</head><body>
+<div id="status">disconnected</div>
+<div id="content">
+  <div class="empty" id="placeholder">Waiting for canvas content...</div>
+</div>
+<script>
+const content = document.getElementById('content');
+const status = document.getElementById('status');
+const placeholder = document.getElementById('placeholder');
+let ws;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/canvas`);
+  ws.onopen = () => { status.textContent = 'connected'; status.className = 'connected'; };
+  ws.onclose = () => { status.textContent = 'disconnected'; status.className = ''; setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'canvas_update') {
+      if (placeholder) placeholder.remove();
+      const block = msg.block;
+      const div = document.createElement('div');
+      div.className = 'canvas-block';
+      if (block.type === 'html') {
+        div.innerHTML = (block.title ? '<h2>' + block.title + '</h2>' : '') + block.content;
+        // Execute any script tags in the HTML content
+        div.querySelectorAll('script').forEach(old => {
+          const s = document.createElement('script');
+          s.textContent = old.textContent;
+          old.replaceWith(s);
+        });
+      } else {
+        div.innerHTML = (block.title ? '<h2>' + block.title + '</h2>' : '') + '<pre>' + block.content.replace(/</g,'&lt;') + '</pre>';
+      }
+      content.innerHTML = '';
+      content.appendChild(div);
+    }
+  };
+}
+connect();
+</script>
+</body></html>"""
+
+
+@app.get("/canvas")
+async def canvas_page():
+    return HTMLResponse(CANVAS_PAGE)
+
+
+@app.websocket("/ws/canvas")
+async def canvas_ws(ws: WebSocket):
+    await ws.accept()
+    _canvas_clients.add(ws)
+    print(f"[Canvas] Display client connected ({len(_canvas_clients)} total)")
+    try:
+        while True:
+            await ws.receive_text()  # keep alive, ignore messages
+    except Exception:
+        pass
+    finally:
+        _canvas_clients.discard(ws)
+        print(f"[Canvas] Display client disconnected ({len(_canvas_clients)} total)")
+
 
 @app.get("/{filename:path}")
 async def serve_static(filename: str):

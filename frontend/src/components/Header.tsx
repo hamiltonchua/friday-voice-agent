@@ -25,7 +25,7 @@ export function Header({ statusText, statusClass, connectionDot, meetingMode, en
         borderBottom: '1px solid rgba(255,255,255,0.08)',
       }}
     >
-      <h1 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Kismet</h1>
+      <h1 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Kismet Labs</h1>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className={`conn-dot ${connectionDot}`} />
         {canvasEnabled && (
