@@ -439,7 +439,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
                     "x-openclaw-agent-id": OPENCLAW_AGENT,
                 },
                 json={
-                    "model": "anthropic/claude-sonnet-4-6",
+                    "model": os.getenv("OPENCLAW_MODEL", "anthropic/claude-haiku-3.5-20241022"),
                     "messages": messages,
                     "user": "voice-chat",
                     "stream": True,
