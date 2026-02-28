@@ -11,3 +11,7 @@ chatterbox-tts
 
 # Speaker verification (Phase 5)
 speechbrain>=1.0.0
+
+# WebAuthn authentication (Phase 14)
+webauthn>=2.0.0
+itsdangerous>=2.0.0

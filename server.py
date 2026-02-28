@@ -30,6 +30,7 @@ from platform_config import (
     MLX_STT_MODEL, MLX_TTS_MODEL, MLX_TTS_MODEL_FALLBACK,
     print_config,
 )
+from auth import mount_auth_routes, auth_middleware, is_ws_authenticated
 
 # ---------------------------------------------------------------------------
 # Config
@@ -656,6 +657,13 @@ class MeetingSession:
 
 app = FastAPI(title="Kismet Voice Agent")
 
+# --- WebAuthn authentication ---
+mount_auth_routes(app)
+
+@app.middleware("http")
+async def _auth_middleware(request, call_next):
+    return await auth_middleware(request, call_next)
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -781,6 +789,9 @@ async def canvas_page():
 
 @app.websocket("/ws/canvas")
 async def canvas_ws(ws: WebSocket):
+    if not is_ws_authenticated(ws):
+        await ws.close(code=4401, reason="Unauthorized")
+        return
     await ws.accept()
     _canvas_clients.add(ws)
     print(f"[Canvas] Display client connected ({len(_canvas_clients)} total)")
@@ -814,6 +825,9 @@ async def serve_static(filename: str):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if not is_ws_authenticated(ws):
+        await ws.close(code=4401, reason="Unauthorized")
+        return
     await ws.accept()
     print("[WS] Client connected")
 

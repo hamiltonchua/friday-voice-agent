@@ -20,3 +20,6 @@ voices/*_embedding.npy
 .DS_Store
 .env
 *.ppn
+
+# WebAuthn credentials
+auth_credentials.json
