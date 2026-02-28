@@ -8,6 +8,7 @@ Provides:
 - JSON file-based credential storage
 """
 
+import io
 import json
 import os
 import secrets
@@ -288,6 +289,24 @@ init();
 </script>
 </body></html>"""
 
+def _generate_qr_svg(data: str) -> str:
+    """Generate a QR code as an SVG string. Uses qrcode lib if available, falls back to text."""
+    try:
+        import qrcode
+        import qrcode.image.svg
+        factory = qrcode.image.svg.SvgPathImage
+        img = qrcode.make(data, image_factory=factory, box_size=10, border=2)
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue().decode("utf-8")
+    except ImportError:
+        return f'<p style="color:#ff6b6b">Install qrcode: pip install qrcode</p>'
+
+
+# One-time invite tokens: token -> expiry timestamp
+_invite_tokens: dict[str, float] = {}
+INVITE_TTL = 300  # 5 minutes
+
 ADD_DEVICE_PAGE = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -328,9 +347,11 @@ ADD_DEVICE_PAGE = """<!DOCTYPE html>
   <h1>Add New Device</h1>
   <p class="sub">Register a passkey for this device</p>
   <button id="regBtn" onclick="doRegister()">Register This Device</button>
+  <button id="inviteBtn" onclick="genInvite()">Generate Invite Link (5 min)</button>
   <button class="back" onclick="window.location.href='/'">Back to App</button>
   <p class="error" id="error"></p>
   <p class="success" id="success"></p>
+  <p id="invite" style="margin-top:16px;word-break:break-all;font-size:0.8rem;color:#aaa;"></p>
 </div>
 <script>
 async function doRegister() {
@@ -384,6 +405,26 @@ async function doRegister() {
   }
 }
 
+function renderQR(svgMarkup) {
+  return '<div style="margin:16px auto;display:inline-block;background:#fff;padding:12px;border-radius:8px">' + svgMarkup + '</div>';
+}
+
+async function genInvite() {
+  const btn = document.getElementById('inviteBtn');
+  const inv = document.getElementById('invite');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/auth/create-invite', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed');
+    const qr = renderQR(data.qr_svg);
+    inv.innerHTML = qr + '<br><a href="' + data.url + '" style="color:#555;font-size:0.7rem">' + data.url + '</a>';
+  } catch(e) {
+    document.getElementById('error').textContent = e.message;
+  }
+  btn.disabled = false;
+}
+
 function b64urlToBuffer(b64url) {
   const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
   const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
@@ -422,6 +463,59 @@ def mount_auth_routes(app):
             from fastapi.responses import RedirectResponse
             return RedirectResponse("/login", status_code=302)
         return HTMLResponse(ADD_DEVICE_PAGE)
+
+    @app.post("/auth/create-invite")
+    async def create_invite(request: Request):
+        """Generate a one-time invite link for registering a new device."""
+        if not is_authenticated(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        token = secrets.token_urlsafe(32)
+        _invite_tokens[token] = time.time() + INVITE_TTL
+        # Clean expired
+        now = time.time()
+        for k in [k for k, v in _invite_tokens.items() if v < now]:
+            del _invite_tokens[k]
+        origin = _get_origin(request)
+        url = f"{origin}/auth/invite?token={token}"
+        print(f"[Auth] Invite link created, expires in {INVITE_TTL}s")
+        # Generate QR code SVG
+        qr_svg = _generate_qr_svg(url)
+        return JSONResponse({"url": url, "expires_in": INVITE_TTL, "qr_svg": qr_svg})
+
+    @app.get("/auth/invite")
+    async def invite_page(request: Request):
+        """One-time invite registration page for new devices."""
+        token = request.query_params.get("token", "")
+        expiry = _invite_tokens.get(token)
+        if not expiry or time.time() > expiry:
+            return HTMLResponse("<html><body style='background:#1a1a2e;color:#ff6b6b;display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui'><h1>Invalid or expired invite link</h1></body></html>", status_code=403)
+        # Serve a registration page that passes the token
+        page = LOGIN_PAGE.replace(
+            "let isRegister = false;",
+            "let isRegister = true; const inviteToken = '" + token + "';"
+        ).replace(
+            "const res = await fetch('/auth/status');",
+            "// invite mode"
+        ).replace(
+            "const data = await res.json();",
+            "const data = {has_credentials: false};"
+        ).replace(
+            "btn.textContent = isRegister ? 'Register Touch ID' : 'Authenticate with Touch ID';",
+            "btn.textContent = 'Register This Device';"
+        ).replace(
+            "async function register() {",
+            "async function register() { const tokenParam = inviteToken;"
+        ).replace(
+            "const optRes = await fetch('/auth/register-options', { method: 'POST' });",
+            "const optRes = await fetch('/auth/register-options?invite=' + tokenParam, { method: 'POST' });"
+        ).replace(
+            "const verifyRes = await fetch('/auth/register-verify',",
+            "const verifyRes = await fetch('/auth/register-verify?invite=' + tokenParam,"
+        ).replace(
+            "Kismet — Authenticate",
+            "Kismet — Device Registration"
+        )
+        return HTMLResponse(page)
 
     @app.post("/auth/register-options")
     async def register_options(request: Request):
@@ -487,6 +581,12 @@ def mount_auth_routes(app):
         })
         _save_credentials(creds)
         print(f"[Auth] WebAuthn credential registered: {cred_id_b64[:16]}...")
+
+        # Consume invite token if used
+        invite = request.query_params.get("invite", "")
+        if invite and invite in _invite_tokens:
+            del _invite_tokens[invite]
+            print("[Auth] Invite token consumed")
 
         # Set session cookie
         response = JSONResponse({"status": "ok"})
@@ -596,7 +696,8 @@ def _consume_challenge() -> bytes:
 
 # Paths that don't require authentication
 _PUBLIC_PATHS = {"/login", "/auth/status", "/auth/login-options",
-                 "/auth/login-verify", "/auth/add-device"}
+                 "/auth/login-verify", "/auth/add-device",
+                 "/auth/create-invite", "/auth/invite"}
 # Registration paths are public ONLY when no credentials exist (first-time setup)
 _REGISTRATION_PATHS = {"/auth/register-options", "/auth/register-verify"}
 
@@ -623,9 +724,11 @@ async def auth_middleware(request: Request, call_next):
     if path in _PUBLIC_PATHS:
         return await call_next(request)
 
-    # Registration endpoints: public only during first-time setup (no credentials yet)
+    # Registration endpoints: allowed during first-time setup, with auth, or with valid invite token
     if path in _REGISTRATION_PATHS:
-        if not _has_credentials() or is_authenticated(request):
+        invite = request.query_params.get("invite", "")
+        invite_valid = invite and invite in _invite_tokens and time.time() < _invite_tokens.get(invite, 0)
+        if not _has_credentials() or is_authenticated(request) or invite_valid:
             return await call_next(request)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
