@@ -19,13 +19,11 @@ from urllib.parse import urlparse
 from fastapi import Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from webauthn import (
-    generate_registration_options,
-    verify_registration_response,
-    generate_authentication_options,
-    verify_authentication_response,
-    options_to_json,
-)
+from webauthn.registration.generate_registration_options import generate_registration_options
+from webauthn.registration.verify_registration_response import verify_registration_response
+from webauthn.authentication.generate_authentication_options import generate_authentication_options
+from webauthn.authentication.verify_authentication_response import verify_authentication_response
+from webauthn.helpers.options_to_json import options_to_json
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
     ResidentKeyRequirement,
