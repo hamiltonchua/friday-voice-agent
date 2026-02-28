@@ -288,6 +288,117 @@ init();
 </script>
 </body></html>"""
 
+ADD_DEVICE_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kismet — Add Device</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    background: #16213e; border-radius: 16px; padding: 48px 40px;
+    text-align: center; max-width: 400px; width: 90%;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 8px; color: #fff; }
+  .sub { color: #888; font-size: 0.9rem; margin-bottom: 32px; }
+  button {
+    background: #00d97e; color: #1a1a2e; border: none;
+    padding: 14px 32px; border-radius: 10px; font-size: 1rem;
+    font-weight: 600; cursor: pointer; width: 100%;
+    transition: background 0.2s; margin-bottom: 12px;
+  }
+  button:hover { background: #00c06e; }
+  button:disabled { background: #555; color: #999; cursor: not-allowed; }
+  .back { background: transparent; color: #888; font-size: 0.85rem; border: 1px solid #333; }
+  .back:hover { background: #1a1a2e; color: #ccc; }
+  .error { color: #ff6b6b; margin-top: 16px; font-size: 0.85rem; }
+  .success { color: #00d97e; margin-top: 16px; font-size: 0.85rem; }
+  .icon { font-size: 3rem; margin-bottom: 16px; }
+</style>
+</head><body>
+<div class="card">
+  <div class="icon">&#x1F4F1;</div>
+  <h1>Add New Device</h1>
+  <p class="sub">Register a passkey for this device</p>
+  <button id="regBtn" onclick="doRegister()">Register This Device</button>
+  <button class="back" onclick="window.location.href='/'">Back to App</button>
+  <p class="error" id="error"></p>
+  <p class="success" id="success"></p>
+</div>
+<script>
+async function doRegister() {
+  const btn = document.getElementById('regBtn');
+  const err = document.getElementById('error');
+  const ok = document.getElementById('success');
+  err.textContent = ''; ok.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Waiting for biometric...';
+
+  try {
+    const optRes = await fetch('/auth/register-options', { method: 'POST' });
+    if (!optRes.ok) throw new Error('Failed to get registration options');
+    const options = await optRes.json();
+
+    options.challenge = b64urlToBuffer(options.challenge);
+    options.user.id = b64urlToBuffer(options.user.id);
+    if (options.excludeCredentials) {
+      options.excludeCredentials = options.excludeCredentials.map(c => ({
+        ...c, id: b64urlToBuffer(c.id)
+      }));
+    }
+
+    const credential = await navigator.credentials.create({ publicKey: options });
+    const body = {
+      id: credential.id,
+      rawId: bufferToB64url(credential.rawId),
+      type: credential.type,
+      response: {
+        attestationObject: bufferToB64url(credential.response.attestationObject),
+        clientDataJSON: bufferToB64url(credential.response.clientDataJSON),
+      }
+    };
+
+    const verifyRes = await fetch('/auth/register-verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!verifyRes.ok) {
+      const d = await verifyRes.json();
+      throw new Error(d.detail || 'Registration failed');
+    }
+
+    ok.textContent = 'Device registered! Redirecting...';
+    setTimeout(() => window.location.href = '/', 1500);
+  } catch(e) {
+    err.textContent = e.message || 'Registration failed';
+    btn.textContent = 'Register This Device';
+    btn.disabled = false;
+  }
+}
+
+function b64urlToBuffer(b64url) {
+  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+  const bin = atob(b64 + pad);
+  return Uint8Array.from(bin, c => c.charCodeAt(0)).buffer;
+}
+function bufferToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+</script>
+</body></html>"""
+
 
 # ---------------------------------------------------------------------------
 # API Endpoints (to be mounted on the FastAPI app)
@@ -303,6 +414,14 @@ def mount_auth_routes(app):
     @app.get("/auth/status")
     async def auth_status():
         return JSONResponse({"has_credentials": _has_credentials()})
+
+    @app.get("/auth/add-device")
+    async def add_device_page(request: Request):
+        """Register a new device — requires existing authenticated session."""
+        if not is_authenticated(request):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse("/login", status_code=302)
+        return HTMLResponse(ADD_DEVICE_PAGE)
 
     @app.post("/auth/register-options")
     async def register_options(request: Request):
@@ -476,9 +595,10 @@ def _consume_challenge() -> bytes:
 # ---------------------------------------------------------------------------
 
 # Paths that don't require authentication
-_PUBLIC_PATHS = {"/login", "/auth/status", "/auth/register-options",
-                 "/auth/register-verify", "/auth/login-options",
-                 "/auth/login-verify"}
+_PUBLIC_PATHS = {"/login", "/auth/status", "/auth/login-options",
+                 "/auth/login-verify", "/auth/add-device"}
+# Registration paths are public ONLY when no credentials exist (first-time setup)
+_REGISTRATION_PATHS = {"/auth/register-options", "/auth/register-verify"}
 
 
 def is_authenticated(request: Request) -> bool:
@@ -502,6 +622,12 @@ async def auth_middleware(request: Request, call_next):
     # Allow public paths
     if path in _PUBLIC_PATHS:
         return await call_next(request)
+
+    # Registration endpoints: public only during first-time setup (no credentials yet)
+    if path in _REGISTRATION_PATHS:
+        if not _has_credentials() or is_authenticated(request):
+            return await call_next(request)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     # Check session
     if is_authenticated(request):
