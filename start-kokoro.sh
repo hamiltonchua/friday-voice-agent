@@ -27,6 +27,9 @@ export MLX_TTS_MODEL=mlx-community/Kokoro-82M-bf16
 export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-true}
 export SPEAKER_VERIFY=${SPEAKER_VERIFY:-true}
 
+# Inherit gateway token from system env so it stays current after rotations
+export OPENCLAW_TOKEN="${OPENCLAW_TOKEN:-$OPENCLAW_GATEWAY_TOKEN}"
+
 # Unbuffered output for logging
 export PYTHONUNBUFFERED=1
 

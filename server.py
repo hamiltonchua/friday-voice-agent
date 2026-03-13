@@ -122,7 +122,7 @@ tts_model = None
 tts_sample_rate = None
 wake_word_model = None
 deepfilter_model = None  # DeepFilterNet model + state
-conversation_history = []
+conversation_history = []  # Local display log only — OpenClaw session manages LLM context
 _model_lock = threading.Lock()  # Prevent concurrent MLX/GPU model loads
 _models_ready = False  # True once startup preload completes
 _deepfilter_available = True  # Set to False if import fails
@@ -416,13 +416,13 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
 
     # Prepend /think:off directive to disable extended thinking (reduces latency for voice)
     prefixed_text = f"/think:off {user_text}"
+
+    # Send only the latest message — OpenClaw's session manages conversation
+    # context (transcript + LCM compaction) server-side via stable "voice-chat" session key
+    messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, {"role": "user", "content": prefixed_text}]
+
+    # Track locally for UI display
     conversation_history.append({"role": "user", "content": user_text})
-
-    # Keep last 40 messages
-    if len(conversation_history) > 40:
-        conversation_history = conversation_history[-40:]
-
-    messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}] + conversation_history[:-1] + [{"role": "user", "content": prefixed_text}]
 
     full_text = ""
     buffer = ""
@@ -507,7 +507,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
         cancelled = True
 
     if cancelled:
-        # Don't add incomplete response to history, remove user message too
+        # Remove user message from display log on cancel
         if conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
         yield ("cancelled", full_text)
@@ -516,7 +516,7 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
         if buffer.strip():
             yield ("sentence", buffer.strip())
 
-        # Record full response
+        # Track assistant response in display log
         conversation_history.append({"role": "assistant", "content": full_text})
         llm_total_ms = int((time.time() - request_start) * 1000)
         print(f"[LLM] → \"{full_text[:80]}...\" ({llm_total_ms}ms)" if len(full_text) > 80 else f"[LLM] → \"{full_text}\" ({llm_total_ms}ms)")
@@ -1076,6 +1076,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Extract and push canvas blocks if enabled
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
+                    # Update display log with cleaned text (no canvas markup)
                     if conversation_history and conversation_history[-1]["role"] == "assistant":
                         conversation_history[-1]["content"] = cleaned_text
                     if canvas_blocks:
@@ -1182,6 +1183,7 @@ async def websocket_endpoint(ws: WebSocket):
             elif event_type == "done":
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
+                    # Update display log with cleaned text (no canvas markup)
                     if conversation_history and conversation_history[-1]["role"] == "assistant":
                         conversation_history[-1]["content"] = cleaned_text
                     if canvas_blocks:
@@ -1352,10 +1354,10 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception:
                     pass
 
-            # Add response to transcript
+            # Add response to meeting transcript + display log
             if full_text:
                 meeting_session.add_entry("Kismet", full_text)
-                conversation_history.append({"role": "assistant", "content": full_text})
+                conversation_history.append({"role": "assistant", "content": full_text})  # display log only
 
             await ws.send_json({
                 "type": "stream_end",
@@ -1520,7 +1522,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg["type"] == "clear":
                 cancel_event.set()
-                conversation_history.clear()
+                conversation_history.clear()  # Clear display log (OpenClaw session persists server-side)
                 if meeting_session:
                     meeting_session.clear()
                 await ws.send_json({"type": "status", "text": "Conversation cleared."})

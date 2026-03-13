@@ -219,6 +219,17 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 
 ---
 
+## Text Chat Input ✅
+*Type messages when voice isn't practical (noisy environments, public spaces).*
+
+- [x] Text input field in the voice agent UI
+- [x] Send pre-transcribed text through same LLM pipeline
+- [x] Same WebSocket connection, no extra auth
+
+**Completed:** 2026-03-13
+
+---
+
 ## Future
 
 ### Phase 11: Token-Aware Context Management *(planned)*
@@ -239,7 +250,8 @@ Goal: Transform push-to-talk voice chat into a natural, always-on voice assistan
 
 **Depends on:** Phase 5 (speaker verification)
 
-### Phase 7 Remaining Items *(backlog)*
+### Phase 15: Quality of Life *(backlog)*
+*UX and operational improvements.*
 
 - [ ] Mobile-friendly layout
 - [ ] Conversation export (save transcript)
