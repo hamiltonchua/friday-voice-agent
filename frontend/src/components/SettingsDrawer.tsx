@@ -9,13 +9,15 @@ interface SettingsDrawerProps {
   verifyEnabled: boolean
   canvasEnabled: boolean
   noiseSuppressionEnabled: boolean
+  voiceEnabled: boolean
   onEnroll: () => void
   onVerifyToggle: () => void
   onCanvasToggle: () => void
   onNoiseSuppressionToggle: () => void
+  onVoiceToggle: () => void
 }
 
-export function SettingsDrawer({ enrolled, verifyEnabled, canvasEnabled, noiseSuppressionEnabled, onEnroll, onVerifyToggle, onCanvasToggle, onNoiseSuppressionToggle }: SettingsDrawerProps) {
+export function SettingsDrawer({ enrolled, verifyEnabled, canvasEnabled, noiseSuppressionEnabled, voiceEnabled, onEnroll, onVerifyToggle, onCanvasToggle, onNoiseSuppressionToggle, onVoiceToggle }: SettingsDrawerProps) {
   const [open, setOpen] = useState(false)
 
   const handleEnroll = () => {
@@ -41,6 +43,48 @@ export function SettingsDrawer({ enrolled, verifyEnabled, canvasEnabled, noiseSu
         </SheetHeader>
 
         <div style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 20 }}>
+          {/* Voice Input */}
+          <div>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 12 }}>
+              Voice Input
+            </p>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--surface2)', borderRadius: 8 }}>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text2)' }}>Microphone & VAD</span>
+              <button
+                onClick={onVoiceToggle}
+                style={{
+                  width: 40,
+                  height: 22,
+                  borderRadius: 11,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: voiceEnabled ? 'var(--green)' : 'var(--surface)',
+                  position: 'relative',
+                  transition: 'background 0.2s',
+                }}
+                title="Toggle voice input"
+              >
+                <span style={{
+                  position: 'absolute',
+                  top: 2,
+                  left: voiceEnabled ? 20 : 2,
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  background: 'white',
+                  transition: 'left 0.2s',
+                }} />
+              </button>
+            </div>
+
+            <p style={{ fontSize: '0.7rem', color: 'var(--text2)', marginTop: 8 }}>
+              {voiceEnabled
+                ? 'Voice input enabled. Use mic, wake word, or hands-free mode.'
+                : 'Voice input disabled. Use text chat only. Toggle on to resume voice.'}
+            </p>
+          </div>
+
           {/* Speaker Verification */}
           <div>
             <p style={{ fontSize: '0.75rem', color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 12 }}>

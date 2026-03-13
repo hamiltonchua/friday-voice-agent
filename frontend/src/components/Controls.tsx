@@ -11,6 +11,7 @@ interface ControlsProps {
   wakeWordEnabled: boolean
   audioLevelRingRef: React.RefObject<HTMLDivElement | null>
   meetingMode: boolean
+  voiceEnabled: boolean
   onMicDown: (e: React.MouseEvent | React.TouchEvent) => void
   onMicUp: (e: React.MouseEvent | React.TouchEvent) => void
   onMicLeave: () => void
@@ -28,7 +29,7 @@ interface ControlsProps {
 
 export function Controls({
   micState, wakeWordActive, wakeWordEnabled, audioLevelRingRef,
-  meetingMode, onMicDown, onMicUp, onMicLeave,
+  meetingMode, voiceEnabled, onMicDown, onMicUp, onMicLeave,
   onClear, onWakeToggle, onMeetingToggle,
   send, vadRef, meetingModeRef,
   wakeWordEnabledRef, startWakeStream, setStatus, wakeWordName,
@@ -44,6 +45,7 @@ export function Controls({
 
   const micBtnClass = [
     'mic-btn',
+    !voiceEnabled ? 'voice-disabled' : '',
     micState === 'recording' ? 'recording' : '',
     micState === 'vad-active' ? 'vad-active' : '',
     micState === 'sleeping' ? 'sleeping' : '',
@@ -103,7 +105,7 @@ export function Controls({
   return (
     <>
       {/* Floating meeting command button — visible when in meeting mode */}
-      {meetingMode && (
+      {meetingMode && voiceEnabled && (
         <button
           style={{
             position: 'fixed',
@@ -165,24 +167,26 @@ export function Controls({
           </button>
 
           <button
-            className={`ctrl-btn ${wakeWordActive ? 'wake-active' : ''}`}
-            title={wakeWordEnabled ? 'Toggle wake word mode' : 'Toggle hands-free listening'}
+            className={`ctrl-btn ${wakeWordActive ? 'wake-active' : ''} ${!voiceEnabled ? 'voice-disabled' : ''}`}
+            title={!voiceEnabled ? 'Enable voice input first' : wakeWordEnabled ? 'Toggle wake word mode' : 'Toggle hands-free listening'}
             onClick={onWakeToggle}
+            disabled={!voiceEnabled}
           >
             <WakeIcon size={18} />
           </button>
 
           <button
-            className={`ctrl-btn ${meetingMode ? 'meeting-active' : ''}`}
-            title={meetingMode ? 'End meeting mode' : 'Start meeting mode'}
+            className={`ctrl-btn ${meetingMode ? 'meeting-active' : ''} ${!voiceEnabled ? 'voice-disabled' : ''}`}
+            title={!voiceEnabled ? 'Enable voice input first' : meetingMode ? 'End meeting mode' : 'Start meeting mode'}
             onClick={onMeetingToggle}
+            disabled={!voiceEnabled}
           >
             <Radio size={18} />
           </button>
         </div>
 
         {/* Wake word hint text */}
-        {wakeWordActive && micState === 'sleeping' && wakeWordName && (
+        {voiceEnabled && wakeWordActive && micState === 'sleeping' && wakeWordName && (
           <p style={{ fontSize: '0.75rem', color: 'var(--text2)', textAlign: 'center', marginTop: 4 }}>
             Say &ldquo;{wakeWordName}&rdquo; to wake me
           </p>

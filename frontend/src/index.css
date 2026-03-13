@@ -592,6 +592,22 @@ header h1 { font-size: 1.5rem; font-weight: 600; }
 .ctrl-btn.wake-active { background: var(--purple); color: white; }
 .ctrl-btn.meeting-active { background: var(--accent); color: white; }
 
+/* Voice disabled state */
+.mic-btn.voice-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.ctrl-btn.voice-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.ctrl-btn.voice-disabled:hover {
+  transform: none;
+  background: var(--surface2);
+  color: var(--text2);
+}
+
 /* Message row style (new, replaces bubble style) */
 .msg-row {
   display: flex;

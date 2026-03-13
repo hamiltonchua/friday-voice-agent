@@ -60,6 +60,10 @@ export default function App() {
   // ---- Noise suppression ----
   const [noiseSuppressionEnabled, setNoiseSuppressionEnabled] = useState(() => localStorage.getItem('noise_suppression_enabled') === 'true')
 
+  // ---- Voice input toggle ----
+  const [voiceEnabled, setVoiceEnabled] = useState(() => localStorage.getItem('voice_enabled') !== 'false')
+  const voiceEnabledRef = useRef(voiceEnabled)
+
   // ---- Meeting mode ----
   const [meetingMode, setMeetingMode] = useState(false)
   const meetingModeRef = useRef(false)
@@ -88,6 +92,7 @@ export default function App() {
   useEffect(() => { wakeWordEnabledRef.current = wakeWordEnabled }, [wakeWordEnabled])
   useEffect(() => { wakeWordNameRef.current = wakeWordName }, [wakeWordName])
   useEffect(() => { meetingModeRef.current = meetingMode }, [meetingMode])
+  useEffect(() => { voiceEnabledRef.current = voiceEnabled }, [voiceEnabled])
 
   const setStatus = useCallback((text: string, cls: 'active' | 'listening' | 'sleeping' | '' = '') => {
     setStatusText(text)
@@ -262,6 +267,7 @@ export default function App() {
 
   // ---- Meeting mode ----
   const enterMeetingMode = useCallback(async () => {
+    if (!voiceEnabledRef.current) return
     setMeetingMode(true)
     meetingModeRef.current = true
     setMessages([{ id: 'meeting-start', role: 'system', text: 'Meeting mode started. Transcribing all speakers... Say "Hey Friday" to ask a question.' }])
@@ -539,6 +545,7 @@ export default function App() {
 
   // ---- Wake toggle ----
   const handleWakeToggle = useCallback(async () => {
+    if (!voiceEnabledRef.current) return
     if (!wakeWordEnabledRef.current) {
       if (isListening()) {
         pauseVAD()
@@ -586,6 +593,7 @@ export default function App() {
   // ---- Manual mic button ----
   const handleMicDown = useCallback(async (e: React.MouseEvent | React.TouchEvent) => {
     e.preventDefault()
+    if (!voiceEnabledRef.current) return
     if (wakeWordActiveRef.current && clientStateRef.current === 'sleeping') {
       handleWake()
       send({ type: 'set_state', state: 'awake' })
@@ -607,7 +615,7 @@ export default function App() {
       return tag === 'TEXTAREA' || tag === 'INPUT' || (document.activeElement as HTMLElement)?.isContentEditable
     }
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space' && !e.repeat && !isRecording() && !isTyping()) {
+      if (e.code === 'Space' && !e.repeat && !isRecording() && !isTyping() && voiceEnabledRef.current) {
         e.preventDefault()
         handleMicDown(e as unknown as React.MouseEvent)
       }
@@ -657,6 +665,31 @@ export default function App() {
     localStorage.setItem('noise_suppression_enabled', String(next))
     send({ type: 'noise_suppression_toggle', enabled: next })
   }, [noiseSuppressionEnabled, send])
+
+  const handleVoiceToggle = useCallback(() => {
+    const next = !voiceEnabled
+    setVoiceEnabled(next)
+    voiceEnabledRef.current = next
+    localStorage.setItem('voice_enabled', String(next))
+
+    if (!next) {
+      // Turning voice off — stop all audio input
+      if (isRecording()) stopManual()
+      if (vadRef.current) pauseVAD()
+      stopWakeStream()
+      if (wakeWordActiveRef.current) {
+        disableWakeWordMode()
+      }
+      if (meetingMode) {
+        exitMeetingMode()
+      }
+      setMicState('idle')
+      setStatus('Text chat only', '')
+    } else {
+      // Turning voice on — restore to ready state
+      setStatus('Ready — hold mic to talk', 'active')
+    }
+  }, [voiceEnabled, isRecording, stopManual, pauseVAD, stopWakeStream, disableWakeWordMode, meetingMode, exitMeetingMode, setStatus, vadRef])
 
   // Derive connection dot state from existing state
   const connectionDot: 'connected' | 'disconnected' | 'sleeping' | 'connecting' = showReconnectBanner
@@ -748,6 +781,7 @@ export default function App() {
               wakeWordEnabled={wakeWordEnabled}
               audioLevelRingRef={audioLevelRingRef}
               meetingMode={meetingMode}
+              voiceEnabled={voiceEnabled}
               onMicDown={handleMicDown}
               onMicUp={handleMicUp}
               onMicLeave={() => { if (isRecording()) stopManual() }}
@@ -771,10 +805,12 @@ export default function App() {
               verifyEnabled={verifyEnabled}
               canvasEnabled={canvasEnabled}
               noiseSuppressionEnabled={noiseSuppressionEnabled}
+              voiceEnabled={voiceEnabled}
               onEnroll={handleEnrollStart}
               onVerifyToggle={handleVerifyToggle}
               onCanvasToggle={handleCanvasToggle}
               onNoiseSuppressionToggle={handleNoiseSuppressionToggle}
+              onVoiceToggle={handleVoiceToggle}
             />
           </div>
         </div>
@@ -811,6 +847,7 @@ export default function App() {
             wakeWordEnabled={wakeWordEnabled}
             audioLevelRingRef={audioLevelRingRef}
             meetingMode={meetingMode}
+            voiceEnabled={voiceEnabled}
             onMicDown={handleMicDown}
             onMicUp={handleMicUp}
             onMicLeave={() => { if (isRecording()) stopManual() }}
