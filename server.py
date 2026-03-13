@@ -21,7 +21,7 @@ from typing import AsyncIterator
 import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -76,6 +76,10 @@ OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT", "main")
 
 SPEAKER_VERIFY = os.getenv("SPEAKER_VERIFY", "auto")  # "true", "false", or "auto" (verify if enrolled)
 
+# Push endpoint — allows sub-agents to POST results back to the voice UI
+PUSH_SECRET = os.getenv("PUSH_SECRET", OPENCLAW_TOKEN)  # Defaults to OpenClaw token
+PUSH_URL = os.getenv("PUSH_URL", "https://prodigy.skunk-shark.ts.net:8765/push")
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "You are Kismet, a voice assistant. Your response will be spoken aloud via TTS. "
     "STRICT RULES: No emoji. No emoticons. No markdown. No bullet lists. No code blocks. No asterisks. No special characters. "
@@ -118,6 +122,7 @@ import threading
 
 whisper_model = None
 speaker_enrolled_embedding = None  # Cached enrollment embedding
+_push_queue: asyncio.Queue = asyncio.Queue()  # Messages pushed via POST /push → delivered to active WS client
 tts_model = None
 tts_sample_rate = None
 wake_word_model = None
@@ -126,6 +131,14 @@ conversation_history = []  # Local display log only — OpenClaw session manages
 _model_lock = threading.Lock()  # Prevent concurrent MLX/GPU model loads
 _models_ready = False  # True once startup preload completes
 _deepfilter_available = True  # Set to False if import fails
+
+# Persistent HTTP client — reuses TCP connections to OpenClaw gateway (avoids
+# per-request connection setup overhead of ~50-200ms). Created at module level,
+# closed on shutdown via lifespan handler.
+_http_client = httpx.AsyncClient(
+    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    timeout=httpx.Timeout(10.0, read=120.0),
+)
 
 
 def get_whisper():
@@ -366,6 +379,30 @@ SENTENCE_END_RE = re.compile(r'[.!?](?:\s|$)')
 # Canvas block extraction
 CANVAS_BLOCK_RE = re.compile(r'<canvas\s+type="(\w+)"(?:\s+title="([^"]*)")?\s*>(.*?)</canvas>', re.DOTALL)
 
+# Delegate block extraction — Haiku emits this to hand off to Opus
+DELEGATE_RE = re.compile(r'<delegate>(.*?)</delegate>', re.DOTALL)
+
+# Thinking block extraction — strip model reasoning from output
+THINKING_BLOCK_RE = re.compile(r'<thinking>.*?</thinking>', re.DOTALL)
+
+# OpenClaw silent reply tokens — suppress these from voice output
+SILENT_REPLY_TOKEN = "NO_REPLY"
+HEARTBEAT_TOKEN = "HEARTBEAT_OK"
+
+
+def _is_silent_reply(text: str) -> bool:
+    """Check if text is an OpenClaw silent reply token (NO_REPLY or HEARTBEAT_OK)."""
+    normalized = text.strip().upper()
+    return normalized in (SILENT_REPLY_TOKEN, HEARTBEAT_TOKEN)
+
+
+def _is_silent_reply_prefix(text: str) -> bool:
+    """Check if text is a streaming prefix of a silent reply token (e.g. 'NO', 'NO_')."""
+    normalized = re.sub(r'[^A-Z_]', '', text.strip().upper())
+    if not normalized:
+        return False
+    return SILENT_REPLY_TOKEN.startswith(normalized) or HEARTBEAT_TOKEN.startswith(normalized)
+
 
 def extract_canvas_blocks(text: str) -> tuple[str, list[dict]]:
     """Extract <canvas> blocks from text. Returns (cleaned_text, blocks)."""
@@ -402,6 +439,47 @@ async def push_canvas(blocks: list[dict], loop):
         print(f"[Canvas] Pushed {block['type']}: {block['title'] or '(untitled)'} to {len(_canvas_clients)} client(s)")
 
 
+async def run_delegate(task: str):
+    """
+    Call Opus with the delegated task (non-streaming), then push the result
+    to the active voice UI via the push queue.
+    """
+    print(f"[Delegate] Spawning Opus for: \"{task[:80]}\"")
+    full_text = ""
+    try:
+        response = await _http_client.post(
+            OPENCLAW_URL,
+            headers={
+                "Authorization": f"Bearer {OPENCLAW_TOKEN}",
+                "Content-Type": "application/json",
+                "x-openclaw-agent-id": OPENCLAW_AGENT,
+            },
+            json={
+                "model": "anthropic/claude-opus-4-6",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"/think:off {task}"},
+                ],
+                "user": "voice-delegate",
+                "stream": False,
+                "thinking": {"type": "disabled"},
+            },
+            timeout=httpx.Timeout(10.0, read=180.0),
+        )
+        response.raise_for_status()
+        data = response.json()
+        full_text = data["choices"][0]["message"]["content"].strip()
+        # Suppress silent replies from delegate too
+        if _is_silent_reply(full_text):
+            print(f"[Delegate] Silent reply from Opus — suppressing")
+            return
+        print(f"[Delegate] Opus complete ({len(full_text)} chars)")
+    except Exception as e:
+        print(f"[Delegate] Error calling Opus: {e}")
+        full_text = "Sorry, I ran into a problem getting that answer."
+    await _push_queue.put({"text": full_text, "skip_tts": False})
+
+
 async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt: str | None = None) -> AsyncIterator[tuple[str, str]]:
     """
     Stream chat response from OpenClaw.
@@ -429,64 +507,85 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
     cancelled = False
     got_first_token = False
     working_emitted = False
+    silent_reply = False
+    initial_buf = ""  # Buffer initial tokens to detect NO_REPLY before yielding
+    initial_phase = True  # True until we confirm this isn't a silent reply
     request_start = time.time()
 
     try:
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                OPENCLAW_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENCLAW_TOKEN}",
-                    "Content-Type": "application/json",
-                    "x-openclaw-agent-id": OPENCLAW_AGENT,
-                },
-                json={
-                    "model": os.getenv("OPENCLAW_MODEL", "anthropic/claude-haiku-3.5-20241022"),
-                    "messages": messages,
-                    "user": "voice-chat",
-                    "stream": True,
-                    "thinking": {"type": "disabled"},
-                },
-                timeout=120.0,
-            ) as response:
-                response.raise_for_status()
+        async with _http_client.stream(
+            "POST",
+            OPENCLAW_URL,
+            headers={
+                "Authorization": f"Bearer {OPENCLAW_TOKEN}",
+                "Content-Type": "application/json",
+                "x-openclaw-agent-id": OPENCLAW_AGENT,
+            },
+            json={
+                "model": os.getenv("OPENCLAW_MODEL", "anthropic/claude-haiku-3.5-20241022"),
+                "messages": messages,
+                "user": "voice-chat",
+                "stream": True,
+                "thinking": {"type": "disabled"},
+            },
+            timeout=httpx.Timeout(10.0, read=120.0),
+        ) as response:
+            response.raise_for_status()
 
-                async for line in response.aiter_lines():
-                    # Check for cancellation
-                    if cancel_event.is_set():
-                        cancelled = True
-                        print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
-                        break
+            async for line in response.aiter_lines():
+                # Check for cancellation
+                if cancel_event.is_set():
+                    cancelled = True
+                    print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
+                    break
 
-                    # Detect tool usage: >2s without content tokens
-                    if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
-                        working_emitted = True
-                        print("[LLM] Tools likely running (>2s before first token)")
-                        yield ("working", "")
+                # Detect tool usage: >2s without content tokens
+                if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
+                    working_emitted = True
+                    print("[LLM] Tools likely running (>2s before first token)")
+                    yield ("working", "")
 
-                    if not line.startswith("data: "):
-                        continue
+                if not line.startswith("data: "):
+                    continue
 
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
+                data = line[6:]
+                if data == "[DONE]":
+                    break
 
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        token = delta.get("content", "")
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content", "")
 
-                        if token:
-                            if not got_first_token:
-                                ttft_ms = int((time.time() - request_start) * 1000)
-                                print(f"[LLM] TTFT: {ttft_ms}ms")
-                            got_first_token = True
-                            full_text += token
+                    if token:
+                        if not got_first_token:
+                            ttft_ms = int((time.time() - request_start) * 1000)
+                            print(f"[LLM] TTFT: {ttft_ms}ms")
+                        got_first_token = True
+                        full_text += token
+
+                        # Buffer initial tokens to detect NO_REPLY before sending to TTS
+                        if initial_phase:
+                            initial_buf += token
+                            # Check if still a possible silent reply prefix
+                            if _is_silent_reply_prefix(initial_buf):
+                                continue  # Keep buffering
+                            elif _is_silent_reply(initial_buf):
+                                silent_reply = True
+                                print(f"[LLM] Silent reply detected: \"{initial_buf.strip()}\" — suppressing")
+                                continue
+                            else:
+                                # Not a silent reply — flush buffered tokens
+                                initial_phase = False
+                                buffer += initial_buf
+                                for ch in initial_buf:
+                                    yield ("token", ch)
+                        else:
                             buffer += token
                             yield ("token", token)
 
-                            # Check for sentence boundaries
+                        # Check for sentence boundaries (only after initial phase)
+                        if not initial_phase:
                             while True:
                                 match = SENTENCE_END_RE.search(buffer)
                                 if not match:
@@ -499,14 +598,24 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
                                 if sentence:
                                     yield ("sentence", sentence)
 
-                    except json.JSONDecodeError:
-                        continue
+                except json.JSONDecodeError:
+                    continue
 
     except httpx.HTTPError as e:
         print(f"[LLM] HTTP error: {e}")
         cancelled = True
 
-    if cancelled:
+    # Check if the complete response is a silent reply (catches edge cases)
+    if not cancelled and _is_silent_reply(full_text):
+        silent_reply = True
+        print(f"[LLM] Silent reply (complete): \"{full_text.strip()}\" — suppressing")
+
+    if silent_reply:
+        # Remove user message from display log — this was a system housekeeping turn
+        if conversation_history and conversation_history[-1]["role"] == "user":
+            conversation_history.pop()
+        yield ("cancelled", "")
+    elif cancelled:
         # Remove user message from display log on cancel
         if conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
@@ -664,6 +773,9 @@ mount_auth_routes(app)
 
 @app.middleware("http")
 async def _auth_middleware(request, call_next):
+    # /push uses its own Bearer token auth — skip session cookie check
+    if request.url.path == "/push":
+        return await call_next(request)
     return await auth_middleware(request, call_next)
 
 
@@ -676,7 +788,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up Porcupine resources."""
+    """Clean up Porcupine and HTTP client resources."""
     global wake_word_model
     if wake_word_model is not None:
         try:
@@ -685,6 +797,9 @@ async def shutdown_event():
         except Exception:
             pass
         wake_word_model = None
+    # Close persistent HTTP client
+    await _http_client.aclose()
+    print("[HTTP] Client closed.")
 
 
 # Serve React build output (frontend/dist/)
@@ -782,6 +897,39 @@ function connect() {
 connect();
 </script>
 </body></html>"""
+
+
+@app.post("/push")
+async def push_endpoint(request: Request):
+    """
+    Allow sub-agents (e.g. Opus) to POST results back to the active voice UI.
+    The result is spoken aloud and shown in the conversation as an assistant message.
+
+    Auth: Bearer token (same as OPENCLAW_TOKEN / PUSH_SECRET).
+    Body: { "text": "...", "skip_tts": false }
+
+    Sub-agent usage:
+        curl -k -X POST {PUSH_URL} \\
+          -H "Authorization: Bearer <PUSH_SECRET>" \\
+          -H "Content-Type: application/json" \\
+          -d '{{"text": "Your answer here"}}'
+    """
+    from fastapi.responses import JSONResponse
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not PUSH_SECRET or token != PUSH_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    skip_tts = bool(body.get("skip_tts", False))
+    await _push_queue.put({"text": text, "skip_tts": skip_tts})
+    print(f"[Push] Queued ({len(text)} chars): \"{text[:80]}...\"" if len(text) > 80 else f"[Push] Queued: \"{text}\"")
+    return JSONResponse({"ok": True, "queued": True})
 
 
 @app.get("/canvas")
@@ -1002,8 +1150,12 @@ async def websocket_endpoint(ws: WebSocket):
             effective_prompt = SYSTEM_PROMPT + CANVAS_INSTRUCTION
         else:
             effective_prompt = SYSTEM_PROMPT
-        in_canvas_block = False  # Track if we're inside a <canvas> block
-        canvas_token_buf = ""    # Buffer tokens while inside canvas block
+        in_canvas_block = False    # Track if we're inside a <canvas> block
+        canvas_token_buf = ""      # Buffer tokens while inside canvas block
+        in_delegate_block = False  # Track if we're inside a <delegate> block
+        delegate_token_buf = ""    # Buffer tokens while inside delegate block
+        in_thinking_block = False  # Track if we're inside a <thinking> block
+        thinking_token_buf = ""    # Buffer tokens while inside thinking block
 
         async for event_type, data in chat_stream(user_text, cancel_event, effective_prompt):
             if cancel_event.is_set() and event_type not in ("cancelled", "done"):
@@ -1013,6 +1165,30 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "working"})
 
             elif event_type == "token":
+                # Always suppress <thinking> blocks — never spoken or displayed
+                thinking_token_buf += data
+                if not in_thinking_block and '<thinking>' in thinking_token_buf:
+                    in_thinking_block = True
+                if in_thinking_block and '</thinking>' in thinking_token_buf:
+                    in_thinking_block = False
+                    thinking_token_buf = ""
+                    continue
+                if in_thinking_block:
+                    continue
+                thinking_token_buf = ""
+
+                # Always suppress <delegate> blocks — never spoken or displayed
+                delegate_token_buf += data
+                if not in_delegate_block and '<delegate>' in delegate_token_buf:
+                    in_delegate_block = True
+                if in_delegate_block and '</delegate>' in delegate_token_buf:
+                    in_delegate_block = False
+                    delegate_token_buf = ""
+                    continue
+                if in_delegate_block:
+                    continue
+                delegate_token_buf = ""
+
                 if canvas_enabled:
                     canvas_token_buf += data
                     # Detect entering canvas block
@@ -1038,7 +1214,11 @@ async def websocket_endpoint(ws: WebSocket):
                 if cancel_event.is_set():
                     continue
 
-                # Skip TTS for any sentence with canvas markup or while in canvas block
+                # Skip TTS for any sentence with thinking, delegate, or canvas markup
+                if '<thinking>' in data or '</thinking>' in data or in_thinking_block:
+                    continue
+                if '<delegate>' in data or '</delegate>' in data or in_delegate_block:
+                    continue
                 if canvas_enabled and ('<canvas' in data or '</canvas>' in data or in_canvas_block):
                     continue
 
@@ -1080,6 +1260,13 @@ async def websocket_endpoint(ws: WebSocket):
                 return
 
             elif event_type == "done":
+                # Strip thinking blocks from final text
+                if '<thinking>' in data:
+                    data = THINKING_BLOCK_RE.sub("", data).strip()
+                    data = re.sub(r'\n{3,}', '\n\n', data)
+                    if conversation_history and conversation_history[-1]["role"] == "assistant":
+                        conversation_history[-1]["content"] = data
+
                 # Extract and push canvas blocks if enabled
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
@@ -1090,6 +1277,22 @@ async def websocket_endpoint(ws: WebSocket):
                         asyncio.create_task(push_canvas(canvas_blocks, loop))
                         await ws.send_json({"type": "canvas_pushed", "count": len(canvas_blocks)})
                     data = cleaned_text
+
+                # Detect and spawn delegate tasks
+                if '<delegate>' in data:
+                    delegate_match = DELEGATE_RE.search(data)
+                    if delegate_match:
+                        delegate_body = delegate_match.group(1).strip()
+                        task_match = re.search(r'TASK:\s*(.+?)(?:\nPUSH_URL:|$)', delegate_body, re.DOTALL)
+                        if task_match:
+                            task_text = task_match.group(1).strip()
+                            print(f"[Delegate] Detected, spawning Opus: \"{task_text[:80]}\"")
+                            asyncio.create_task(run_delegate(task_text))
+                    # Strip delegate block from display text
+                    data = DELEGATE_RE.sub("", data).strip()
+                    data = re.sub(r'\n{3,}', '\n\n', data)
+                    if conversation_history and conversation_history[-1]["role"] == "assistant":
+                        conversation_history[-1]["content"] = data
 
                 llm_time = time.time() - llm_start
                 last_activity = time.time()
@@ -1131,6 +1334,10 @@ async def websocket_endpoint(ws: WebSocket):
             effective_prompt = SYSTEM_PROMPT
         in_canvas_block = False
         canvas_token_buf = ""
+        in_delegate_block = False
+        delegate_token_buf = ""
+        in_thinking_block = False
+        thinking_token_buf = ""
 
         async for event_type, data in chat_stream(user_text, cancel_event, effective_prompt):
             if cancel_event.is_set() and event_type not in ("cancelled", "done"):
@@ -1140,6 +1347,30 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "working"})
 
             elif event_type == "token":
+                # Always suppress <thinking> blocks — never spoken or displayed
+                thinking_token_buf += data
+                if not in_thinking_block and '<thinking>' in thinking_token_buf:
+                    in_thinking_block = True
+                if in_thinking_block and '</thinking>' in thinking_token_buf:
+                    in_thinking_block = False
+                    thinking_token_buf = ""
+                    continue
+                if in_thinking_block:
+                    continue
+                thinking_token_buf = ""
+
+                # Always suppress <delegate> blocks
+                delegate_token_buf += data
+                if not in_delegate_block and '<delegate>' in delegate_token_buf:
+                    in_delegate_block = True
+                if in_delegate_block and '</delegate>' in delegate_token_buf:
+                    in_delegate_block = False
+                    delegate_token_buf = ""
+                    continue
+                if in_delegate_block:
+                    continue
+                delegate_token_buf = ""
+
                 if canvas_enabled:
                     canvas_token_buf += data
                     if not in_canvas_block and '<canvas' in canvas_token_buf:
@@ -1157,6 +1388,10 @@ async def websocket_endpoint(ws: WebSocket):
                 if first_sentence_time is None:
                     first_sentence_time = time.time() - llm_start
                 if cancel_event.is_set():
+                    continue
+                if '<thinking>' in data or '</thinking>' in data or in_thinking_block:
+                    continue
+                if '<delegate>' in data or '</delegate>' in data or in_delegate_block:
                     continue
                 if canvas_enabled and ('<canvas' in data or '</canvas>' in data or in_canvas_block):
                     continue
@@ -1191,6 +1426,13 @@ async def websocket_endpoint(ws: WebSocket):
                 return
 
             elif event_type == "done":
+                # Strip thinking blocks from final text
+                if '<thinking>' in data:
+                    data = THINKING_BLOCK_RE.sub("", data).strip()
+                    data = re.sub(r'\n{3,}', '\n\n', data)
+                    if conversation_history and conversation_history[-1]["role"] == "assistant":
+                        conversation_history[-1]["content"] = data
+
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
                     # Update display log with cleaned text (no canvas markup)
@@ -1200,6 +1442,21 @@ async def websocket_endpoint(ws: WebSocket):
                         asyncio.create_task(push_canvas(canvas_blocks, loop))
                         await ws.send_json({"type": "canvas_pushed", "count": len(canvas_blocks)})
                     data = cleaned_text
+
+                # Detect and spawn delegate tasks
+                if '<delegate>' in data:
+                    delegate_match = DELEGATE_RE.search(data)
+                    if delegate_match:
+                        delegate_body = delegate_match.group(1).strip()
+                        task_match = re.search(r'TASK:\s*(.+?)(?:\nPUSH_URL:|$)', delegate_body, re.DOTALL)
+                        if task_match:
+                            task_text = task_match.group(1).strip()
+                            print(f"[Delegate] Detected, spawning Opus: \"{task_text[:80]}\"")
+                            asyncio.create_task(run_delegate(task_text))
+                    data = DELEGATE_RE.sub("", data).strip()
+                    data = re.sub(r'\n{3,}', '\n\n', data)
+                    if conversation_history and conversation_history[-1]["role"] == "assistant":
+                        conversation_history[-1]["content"] = data
 
                 llm_time = time.time() - llm_start
                 last_activity = time.time()
@@ -1295,90 +1552,123 @@ async def websocket_endpoint(ws: WebSocket):
             {"role": "user", "content": context_msg},
         ]
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            headers = {"Authorization": f"Bearer {OPENCLAW_TOKEN}"} if OPENCLAW_TOKEN else {}
-            payload = {
-                "model": OPENCLAW_AGENT,
-                "messages": meeting_messages,
-                "stream": True,
-            }
+        headers = {"Authorization": f"Bearer {OPENCLAW_TOKEN}"} if OPENCLAW_TOKEN else {}
+        payload = {
+            "model": OPENCLAW_AGENT,
+            "messages": meeting_messages,
+            "stream": True,
+        }
 
-            full_text = ""
-            buffer = ""
+        full_text = ""
+        buffer = ""
 
-            async with client.stream("POST", OPENCLAW_URL, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    await ws.send_json({"type": "error", "text": "LLM request failed"})
-                    return
+        async with _http_client.stream("POST", OPENCLAW_URL, json=payload, headers=headers, timeout=httpx.Timeout(10.0, read=60.0)) as resp:
+            if resp.status_code != 200:
+                await ws.send_json({"type": "error", "text": "LLM request failed"})
+                return
 
-                async for line in resp.aiter_lines():
-                    if cancel_event.is_set():
-                        break
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0].get("delta", {})
-                        token = delta.get("content", "")
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-
-                    if not token:
-                        continue
-
-                    full_text += token
-                    buffer += token
-                    await ws.send_json({"type": "token", "text": token})
-
-                    # Check for sentence boundaries
-                    while SENTENCE_END_RE.search(buffer):
-                        match = SENTENCE_END_RE.search(buffer)
-                        sentence = buffer[:match.end()].strip()
-                        buffer = buffer[match.end():]
-
-                        if sentence and not cancel_event.is_set():
-                            try:
-                                tts_start = time.time()
-                                audio_out, sr = await loop.run_in_executor(None, synthesize, sentence)
-                                tts_time = time.time() - tts_start
-                                total_tts_time += tts_time
-                                audio_b64 = base64.b64encode(audio_out).decode()
-                                await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": sentence, "index": sentence_count})
-                                sentence_count += 1
-                            except Exception as e:
-                                print(f"[Meeting TTS] Error: {e}")
-
-            # Handle remaining buffer
-            if buffer.strip() and not cancel_event.is_set():
+            async for line in resp.aiter_lines():
+                if cancel_event.is_set():
+                    break
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
                 try:
-                    tts_start = time.time()
-                    audio_out, sr = await loop.run_in_executor(None, synthesize, buffer.strip())
-                    tts_time = time.time() - tts_start
-                    total_tts_time += tts_time
-                    audio_b64 = base64.b64encode(audio_out).decode()
-                    await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": buffer.strip(), "index": sentence_count})
-                    sentence_count += 1
-                except Exception:
-                    pass
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0].get("delta", {})
+                    token = delta.get("content", "")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
 
-            # Add response to meeting transcript + display log
-            if full_text:
-                meeting_session.add_entry("Kismet", full_text)
-                conversation_history.append({"role": "assistant", "content": full_text})  # display log only
+                if not token:
+                    continue
 
-            await ws.send_json({
-                "type": "stream_end",
-                "text": full_text,
-                "times": {"llm": round(time.time() - llm_start, 2), "tts": round(total_tts_time, 2)},
-                "sentences": sentence_count,
-            })
+                full_text += token
+                buffer += token
+                await ws.send_json({"type": "token", "text": token})
+
+                # Check for sentence boundaries
+                while SENTENCE_END_RE.search(buffer):
+                    match = SENTENCE_END_RE.search(buffer)
+                    sentence = buffer[:match.end()].strip()
+                    buffer = buffer[match.end():]
+
+                    if sentence and not cancel_event.is_set():
+                        try:
+                            tts_start = time.time()
+                            audio_out, sr = await loop.run_in_executor(None, synthesize, sentence)
+                            tts_time = time.time() - tts_start
+                            total_tts_time += tts_time
+                            audio_b64 = base64.b64encode(audio_out).decode()
+                            await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": sentence, "index": sentence_count})
+                            sentence_count += 1
+                        except Exception as e:
+                            print(f"[Meeting TTS] Error: {e}")
+
+        # Handle remaining buffer
+        if buffer.strip() and not cancel_event.is_set():
+            try:
+                tts_start = time.time()
+                audio_out, sr = await loop.run_in_executor(None, synthesize, buffer.strip())
+                tts_time = time.time() - tts_start
+                total_tts_time += tts_time
+                audio_b64 = base64.b64encode(audio_out).decode()
+                await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": buffer.strip(), "index": sentence_count})
+                sentence_count += 1
+            except Exception:
+                pass
+
+        # Suppress silent replies from meeting mode
+        if _is_silent_reply(full_text):
+            print(f"[Meeting] Silent reply — suppressing")
+            await ws.send_json({"type": "stream_end", "text": "", "times": {"llm": 0, "tts": 0}, "sentences": 0})
+            return
+
+        # Add response to meeting transcript + display log
+        if full_text:
+            meeting_session.add_entry("Kismet", full_text)
+            conversation_history.append({"role": "assistant", "content": full_text})  # display log only
+
+        await ws.send_json({
+            "type": "stream_end",
+            "text": full_text,
+            "times": {"llm": round(time.time() - llm_start, 2), "tts": round(total_tts_time, 2)},
+            "sentences": sentence_count,
+        })
+
+    async def listen_for_pushes():
+        """
+        Background task: picks up messages from POST /push and delivers them to
+        this WebSocket client as assistant responses (TTS + transcript).
+        Waits for any in-flight processing to complete before speaking.
+        """
+        nonlocal skip_tts
+        while True:
+            try:
+                item = await _push_queue.get()
+                # Wait for any current voice/text processing to finish (up to 60s)
+                if processing_task and not processing_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(processing_task), timeout=60.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                pushed_text = item["text"]
+                old_skip_tts = skip_tts
+                skip_tts = item.get("skip_tts", False)
+                print(f"[Push] Delivering to client: \"{pushed_text[:80]}\"")
+                await process_text(pushed_text)
+                skip_tts = old_skip_tts
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[Push] Error delivering message: {e}")
 
     # Start idle check task if wake word is enabled
     if WAKE_WORD_ENABLED:
         idle_check_task = asyncio.create_task(check_idle())
+    push_listener_task = asyncio.create_task(listen_for_pushes())
 
     try:
         while True:
@@ -1556,6 +1846,7 @@ async def websocket_endpoint(ws: WebSocket):
         cancel_event.set()
         if idle_check_task:
             idle_check_task.cancel()
+        push_listener_task.cancel()
         print("[WS] Client disconnected")
 
 
@@ -1577,6 +1868,7 @@ if __name__ == "__main__":
     print_config()
     print(f"[LLM] OpenClaw endpoint: {OPENCLAW_URL}")
     print(f"[TTS] Engine: {TTS_ENGINE} (backend: {TTS_BACKEND})")
+    print(f"[Push] Endpoint: POST {PUSH_URL}  (Bearer token = PUSH_SECRET or OPENCLAW_TOKEN)")
     if WAKE_WORD_ENABLED:
         print(f"[WakeWord] Porcupine keyword: {WAKE_WORD_KEYWORD}, Sensitivity: {WAKE_WORD_SENSITIVITY}")
     uvicorn.run(app, host="0.0.0.0", port=8765, **kwargs)
