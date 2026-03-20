@@ -23,9 +23,17 @@ export KOKORO_VOICE=af_kore
 export MLX_TTS_VOICE=af_kore
 export MLX_TTS_MODEL=mlx-community/Kokoro-82M-bf16
 
+# STT model (Parakeet — 4x faster than Whisper)
+export MLX_STT_MODEL=${MLX_STT_MODEL:-mlx-community/parakeet-tdt-0.6b-v3}
+
 # Feature flags (set to "false" to disable)
 export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-true}
 export SPEAKER_VERIFY=${SPEAKER_VERIFY:-true}
+
+# Smart Turn endpoint detection (turn-taking prediction)
+export SMART_TURN_ENABLED=${SMART_TURN_ENABLED:-true}
+export SMART_TURN_THRESHOLD=${SMART_TURN_THRESHOLD:-0.5}
+export SMART_TURN_MAX_WAIT_SEC=${SMART_TURN_MAX_WAIT_SEC:-3.0}
 
 # Inherit gateway token from system env so it stays current after rotations
 export OPENCLAW_TOKEN="${OPENCLAW_TOKEN:-$OPENCLAW_GATEWAY_TOKEN}"
@@ -36,4 +44,4 @@ export PYTHONUNBUFFERED=1
 # Run the server
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
-exec python3 server.py "$@"
+exec python3 server.py "$@" > /tmp/voice-agent.log 2>&1

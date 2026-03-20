@@ -10,7 +10,8 @@ Built by [Kismet Labs](https://kismetlabs.com), an AI consulting firm in the Phi
 Browser (mic) → WebSocket → Server
                               ├─ Wake Word: Porcupine (CPU, "Hey Friday")
                               ├─ Speaker Verification: SpeechBrain ECAPA-TDNN (CPU)
-                              ├─ STT: MLX Whisper (macOS) / faster-whisper (CUDA)
+                              ├─ STT: MLX Parakeet (macOS) / faster-whisper (CUDA)
+                              ├─ Smart Turn: turn-taking prediction (avoid mid-thought cutoffs)
                               ├─ LLM: OpenClaw /v1/chat/completions → your agent
                               ├─ TTS: MLX Kokoro/Chatterbox (macOS) / Chatterbox (CUDA) / Kokoro ONNX (CPU)
                               └─ Canvas: /canvas WebSocket → visual display panel
@@ -27,7 +28,7 @@ The server auto-detects your hardware and selects the right backends:
 
 | Platform | STT | TTS | Notes |
 |---|---|---|---|
-| **macOS Apple Silicon** | MLX Whisper (large-v3-turbo) | MLX Kokoro / Chatterbox | Metal acceleration, no CUDA needed |
+| **macOS Apple Silicon** | MLX Parakeet TDT 0.6B v3 | MLX Kokoro / Chatterbox | Metal acceleration, no CUDA needed |
 | **Linux + NVIDIA GPU** | faster-whisper (large-v3) | Chatterbox Turbo | CUDA, 6GB+ VRAM recommended |
 | **CPU-only** | faster-whisper (CPU mode) | Kokoro ONNX | Slower, but works anywhere |
 
@@ -41,7 +42,8 @@ Override auto-detection with `KISMET_PLATFORM=mlx|cuda|cpu` or set `STT_BACKEND`
 - **Voice Activity Detection (VAD)** — hands-free, no button required
 - **Interruption support** — talk over the agent and it stops to listen
 - **Voice Cloning** — Chatterbox TTS supports cloning from a reference audio file
-- **Noise Suppression** — DeepFilterNet cleans up audio input in real time (toggleable)
+- **Noise Suppression** — MLX DeepFilterNet cleans up audio input in real time (Metal-accelerated, toggleable)
+- **Smart Turn** — SmartTurn v3 endpoint detection predicts when the user has finished speaking, avoiding mid-thought cutoffs
 - **WebAuthn / Touch ID** — passkey authentication with multi-device enrollment via QR invite
 - **Auto-Reconnection** — WebSocket reconnects with exponential backoff
 - **Audio Level Visualizer** — mic input levels shown on the mic button
@@ -124,7 +126,7 @@ Copy `.env.example` to `.env` and fill in your values:
 | Variable | Default | Description |
 |---|---|---|
 | `STT_BACKEND` | *(auto)* | `mlx-audio` (macOS) or `faster-whisper` (CUDA/CPU) |
-| `MLX_STT_MODEL` | `mlx-community/whisper-large-v3-turbo-asr-fp16` | MLX Whisper model |
+| `MLX_STT_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | MLX STT model (Parakeet) |
 | `WHISPER_MODEL` | `large-v3` | faster-whisper model size |
 | `WHISPER_DEVICE` | `cuda` | Device for faster-whisper (`cuda`, `cpu`) |
 
@@ -152,6 +154,14 @@ Copy `.env.example` to `.env` and fill in your values:
 | `SPEAKER_VERIFY` | `auto` | Speaker verification (`auto`, `true`, `false`) |
 | `SPEAKER_VERIFY_THRESHOLD` | `0.65` | Cosine similarity threshold |
 | `IDLE_TIMEOUT_SEC` | `30` | Seconds before returning to sleep |
+
+### Smart Turn (Endpoint Detection)
+
+| Variable | Default | Description |
+|---|---|---|
+| `SMART_TURN_ENABLED` | `true` | Enable SmartTurn turn-taking prediction |
+| `SMART_TURN_THRESHOLD` | `0.5` | Probability threshold for "turn complete" (0-1) |
+| `SMART_TURN_MAX_WAIT_SEC` | `3.0` | Force-send after this many seconds of silence |
 
 ### LLM
 
@@ -234,7 +244,7 @@ The UI is a React 19 + TypeScript app built with Vite, Tailwind CSS, and [shadcn
 | Styling | Tailwind CSS v4 |
 | UI Components | shadcn/ui (Radix UI primitives) |
 | Icons | Lucide React |
-| VAD | @ricky0123/vad-web (Silero VAD, ONNX) |
+| VAD | @ricky0123/vad-web v0.0.30 (Silero V5, ONNX) |
 | Toasts | Sonner |
 
 ### Structure
@@ -302,11 +312,12 @@ Wake word (Porcupine) and speaker verification (SpeechBrain) run on CPU on all p
 - [x] **Phase 12:** Noise suppression — DeepFilterNet with UI toggle
 - [x] **Phase 13:** Pipeline observability — timing metrics, configurable model, restart script
 - [x] **Phase 14:** WebAuthn authentication — Touch ID / passkey, multi-device QR invite
+- [x] **Phase 16:** SmartTurn v3 endpoint detection — turn-taking prediction to avoid mid-thought cutoffs
 - [x] **Text chat input** — type messages when voice isn't practical
 - [x] **Context delegation** — removed client-side 40-message window; OpenClaw session + LCM manages context server-side
 - ~~Phase 11 (token-aware context management)~~ — eliminated, superseded by context delegation
-- [ ] **Phase 8:** Meeting companion — passive transcription with diarization *(parked)*
-- [ ] **Phase 15:** Quality of life — mobile layout, conversation export, multi-speaker enrollment, performance profiling *(backlog)*
+- [ ] **Phase 15:** Meeting companion — passive transcription with diarization (Sortformer via mlx-audio) *(parked)*
+- [ ] **Phase 17:** Quality of life — mobile layout, conversation export, multi-speaker enrollment, performance profiling *(backlog)*
 
 See [ROADMAP.md](ROADMAP.md) for full details on each phase.
 

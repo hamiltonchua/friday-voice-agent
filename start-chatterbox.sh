@@ -11,9 +11,17 @@ export PYTHONNOUSERSITE=1
 # Set TTS engine
 export TTS_ENGINE=chatterbox
 
+# STT model (Parakeet — 4x faster than Whisper)
+export MLX_STT_MODEL=${MLX_STT_MODEL:-mlx-community/parakeet-tdt-0.6b-v3}
+
 # Feature flags (set to "false" to disable)
 export WAKE_WORD_ENABLED=${WAKE_WORD_ENABLED:-false}
 export SPEAKER_VERIFY=${SPEAKER_VERIFY:-false}
+
+# Smart Turn endpoint detection (turn-taking prediction)
+export SMART_TURN_ENABLED=${SMART_TURN_ENABLED:-true}
+export SMART_TURN_THRESHOLD=${SMART_TURN_THRESHOLD:-0.5}
+export SMART_TURN_MAX_WAIT_SEC=${SMART_TURN_MAX_WAIT_SEC:-3.0}
 
 # Voice cloning reference (Majel Barrett / TNG Ship Computer)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

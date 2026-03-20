@@ -11,4 +11,6 @@ speechbrain>=1.0.0
 openwakeword
 
 # Noise suppression (Phase 12)
-deepfilternet
+# macOS: provided by mlx-audio (MLX DeepFilterNet)
+# Linux: uncomment deepfilternet below or add to requirements-linux.txt
+# deepfilternet

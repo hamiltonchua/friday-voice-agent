@@ -31,7 +31,7 @@ _default_stt = "mlx-audio" if PLATFORM == "mlx" else "faster-whisper"
 STT_BACKEND = os.getenv("STT_BACKEND", _default_stt)
 
 # MLX STT model (only used when STT_BACKEND == "mlx-audio")
-MLX_STT_MODEL = os.getenv("MLX_STT_MODEL", "mlx-community/whisper-large-v3-turbo-asr-fp16")
+MLX_STT_MODEL = os.getenv("MLX_STT_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 
 # --- TTS Backend ---
 # "mlx-audio" (macOS/MLX), "chatterbox-cuda" (Linux/CUDA), "kokoro-onnx" (CPU fallback)

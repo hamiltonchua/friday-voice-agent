@@ -54,8 +54,14 @@ WAKE_WORD_KEYWORD = os.getenv("WAKE_WORD_KEYWORD", "jarvis")
 WAKE_WORD_SENSITIVITY = float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5"))  # 0.0-1.0
 IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "30"))  # Return to sleep after this many seconds of silence
 
+# Smart Turn endpoint detection (turn-taking prediction)
+SMART_TURN_ENABLED = os.getenv("SMART_TURN_ENABLED", "true").lower() == "true"
+SMART_TURN_THRESHOLD = float(os.getenv("SMART_TURN_THRESHOLD", "0.5"))  # Probability threshold for "turn complete"
+SMART_TURN_MAX_WAIT_SEC = float(os.getenv("SMART_TURN_MAX_WAIT_SEC", "3.0"))  # Force-send after this silence
+
 # OpenClaw gateway
 OPENCLAW_URL = os.getenv("OPENCLAW_URL", "http://127.0.0.1:18789/v1/chat/completions")
+
 
 def _read_openclaw_token() -> str:
     """Read token from OpenClaw config file, fallback to env var."""
@@ -80,6 +86,7 @@ SPEAKER_VERIFY = os.getenv("SPEAKER_VERIFY", "auto")  # "true", "false", or "aut
 PUSH_SECRET = os.getenv("PUSH_SECRET", OPENCLAW_TOKEN)  # Defaults to OpenClaw token
 PUSH_URL = os.getenv("PUSH_URL", "https://prodigy.skunk-shark.ts.net:8765/push")
 
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "You are Kismet, a voice assistant. Your response will be spoken aloud via TTS. "
     "STRICT RULES: No emoji. No emoticons. No markdown. No bullet lists. No code blocks. No asterisks. No special characters. "
@@ -88,6 +95,14 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "You have a voice agent canvas at /canvas for visual output. There is also a separate 'prodigy node canvas' "
     "managed by Friday. If the user asks to open or show something on the prodigy canvas, tell them to ask Friday."
 ))
+
+# Appended to any task dispatched as a background cron job so the agent's
+# response is voice-friendly when it comes back via the /webhook/cron-result endpoint.
+VOICE_DELEGATE_SUFFIX = (
+    "\n\nIMPORTANT: Your response will be spoken aloud via text-to-speech. "
+    "No markdown, no bullet points, no code blocks, no asterisks, no special characters. "
+    "Plain spoken English only, concise and conversational."
+)
 
 MEETING_SYSTEM_PROMPT = os.getenv("MEETING_SYSTEM_PROMPT", (
     "You are Kismet, a meeting companion assistant. You have access to the meeting transcript so far. "
@@ -126,7 +141,8 @@ _push_queue: asyncio.Queue = asyncio.Queue()  # Messages pushed via POST /push �
 tts_model = None
 tts_sample_rate = None
 wake_word_model = None
-deepfilter_model = None  # DeepFilterNet model + state
+deepfilter_model = None  # MLX DeepFilterNet model (mlx-audio)
+smart_turn_model = None  # SmartTurn endpoint detector (mlx-audio)
 conversation_history = []  # Local display log only — OpenClaw session manages LLM context
 _model_lock = threading.Lock()  # Prevent concurrent MLX/GPU model loads
 _models_ready = False  # True once startup preload completes
@@ -149,7 +165,7 @@ def get_whisper():
                 from mlx_audio.stt.utils import load_model
                 print(f"[STT] Loading MLX model: {MLX_STT_MODEL}...")
                 whisper_model = load_model(MLX_STT_MODEL)
-                print("[STT] MLX Whisper ready.")
+                print(f"[STT] MLX STT ready ({MLX_STT_MODEL}).")
             else:
                 from faster_whisper import WhisperModel
                 print(f"[STT] Loading {WHISPER_MODEL} on {WHISPER_DEVICE}...")
@@ -223,6 +239,8 @@ def preload_models():
     get_tts()
     if WAKE_WORD_ENABLED:
         get_wake_word()
+    if SMART_TURN_ENABLED:
+        get_smart_turn()
     _models_ready = True
     print("[Startup] All models ready.")
 
@@ -247,35 +265,62 @@ def _load_enrolled_embedding():
 
 
 def get_deepfilter():
-    """Lazy-load DeepFilterNet model."""
+    """Lazy-load MLX DeepFilterNet model (mlx-audio)."""
     global deepfilter_model, _deepfilter_available
     if not _deepfilter_available:
         return None
     with _model_lock:
         if deepfilter_model is None:
             try:
-                from df.enhance import init_df
-                print("[Denoise] Loading DeepFilterNet model...")
-                model, df_state, _ = init_df()
-                deepfilter_model = (model, df_state)
-                print("[Denoise] DeepFilterNet ready.")
+                from mlx_audio.sts.models.deepfilternet.model import DeepFilterNetModel
+                print("[Denoise] Loading MLX DeepFilterNet model...")
+                deepfilter_model = DeepFilterNetModel.from_pretrained()
+                print("[Denoise] MLX DeepFilterNet ready.")
             except Exception as e:
-                print(f"[Denoise] WARNING: Failed to load DeepFilterNet: {e}")
+                print(f"[Denoise] WARNING: Failed to load MLX DeepFilterNet: {e}")
                 _deepfilter_available = False
                 return None
     return deepfilter_model
 
 
+def get_smart_turn():
+    """Lazy-load SmartTurn v3 endpoint detector (mlx-audio)."""
+    global smart_turn_model
+    if not SMART_TURN_ENABLED:
+        return None
+    with _model_lock:
+        if smart_turn_model is None:
+            try:
+                from mlx_audio.vad.utils import load_model
+                print("[SmartTurn] Loading SmartTurn v3 model...")
+                smart_turn_model = load_model("mlx-community/smart-turn-v3")
+                print(f"[SmartTurn] Ready (threshold={SMART_TURN_THRESHOLD})")
+            except Exception as e:
+                print(f"[SmartTurn] WARNING: Failed to load: {e}")
+                return None
+    return smart_turn_model
+
+
+def predict_turn_complete(audio_bytes: bytes) -> tuple[bool, float]:
+    """Predict whether the user has finished their turn.
+    Returns (is_complete, probability). Audio is raw PCM 16-bit 16kHz mono."""
+    model = get_smart_turn()
+    if model is None:
+        return True, 1.0  # Fallback: always assume turn complete
+
+    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    result = model.predict_endpoint(pcm, sample_rate=STT_SAMPLE_RATE, threshold=SMART_TURN_THRESHOLD)
+    return bool(result.prediction), result.probability
+
+
 def denoise(audio_bytes: bytes) -> bytes:
-    """Apply DeepFilterNet noise suppression to raw PCM bytes (16-bit 16kHz mono)."""
-    df = get_deepfilter()
-    if df is None:
+    """Apply MLX DeepFilterNet noise suppression to raw PCM bytes (16-bit 16kHz mono)."""
+    df_model = get_deepfilter()
+    if df_model is None:
         return audio_bytes
 
     t0 = time.time()
-    model, df_state = df
 
-    from df.enhance import enhance
     from scipy.signal import resample_poly
 
     # PCM 16-bit → float32
@@ -284,15 +329,8 @@ def denoise(audio_bytes: bytes) -> bytes:
     # Resample 16kHz → 48kHz (DeepFilterNet native rate)
     audio_48k = resample_poly(pcm, up=3, down=1).astype(np.float32)
 
-    # DeepFilterNet expects torch tensor [1, samples]
-    import torch
-    tensor_48k = torch.from_numpy(audio_48k).unsqueeze(0)
-    enhanced = enhance(model, df_state, tensor_48k)
-
-    # enhanced is a numpy array or tensor — ensure numpy
-    if isinstance(enhanced, torch.Tensor):
-        enhanced = enhanced.numpy()
-    enhanced = enhanced.squeeze()
+    # MLX DeepFilterNet: enhance_array takes float32 numpy array, returns numpy array
+    enhanced = df_model.enhance_array(audio_48k)
 
     # Resample 48kHz → 16kHz
     audio_16k = resample_poly(enhanced, up=1, down=3).astype(np.float32)
@@ -341,6 +379,26 @@ def transcribe(audio_bytes: bytes, apply_denoise: bool = False) -> str:
             return text
     finally:
         os.unlink(tmp_path)
+
+
+def transcribe_array(pcm_int16: np.ndarray, apply_denoise: bool = False) -> str:
+    """Transcribe a numpy int16 array directly (no temp file for MLX backend).
+    Falls back to transcribe() for non-MLX backends."""
+    if STT_BACKEND != "mlx-audio":
+        return transcribe(pcm_int16.tobytes(), apply_denoise=apply_denoise)
+
+    import mlx.core as mx
+    model = get_whisper()
+
+    audio_float = pcm_int16.astype(np.float32) / 32768.0
+    if apply_denoise:
+        # Denoise operates on bytes, convert round-trip
+        denoised = denoise(pcm_int16.tobytes())
+        audio_float = np.frombuffer(denoised, dtype=np.int16).astype(np.float32) / 32768.0
+
+    audio_mx = mx.array(audio_float)
+    result = model.generate(audio_mx)
+    return (result.text or "").strip()
 
 
 _porcupine_buffer = np.array([], dtype=np.int16)
@@ -418,6 +476,44 @@ def extract_canvas_blocks(text: str) -> tuple[str, list[dict]]:
     return cleaned, blocks
 
 
+def strip_markdown_for_tts(text: str) -> str:
+    """Strip markdown formatting from text for clean TTS output.
+    Removes: bold/italic markers, headers, code blocks, bullet points, links, etc.
+    Preserves the actual content text."""
+    import re as _re
+    print(f"[Strip] Input: {text[:60]}...")
+    s = text
+    # Remove code blocks (``` ... ```)
+    s = _re.sub(r'```[\s\S]*?```', '', s)
+    # Remove inline code (`...`)
+    s = _re.sub(r'`([^`]+)`', r'\1', s)
+    # Remove bold/italic markers (**, *, __, _)
+    s = _re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', s)
+    s = _re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+    s = _re.sub(r'\*(.+?)\*', r'\1', s)
+    s = _re.sub(r'___(.+?)___', r'\1', s)
+    s = _re.sub(r'__(.+?)__', r'\1', s)
+    s = _re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', s)
+    # Remove headers (# ## ### etc)
+    s = _re.sub(r'^#{1,6}\s+', '', s, flags=_re.MULTILINE)
+    # Remove link syntax [text](url) -> text
+    s = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)
+    # Remove image syntax ![alt](url)
+    s = _re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', s)
+    # Remove bullet points (- or * at start of line)
+    s = _re.sub(r'^\s*[-*+]\s+', '', s, flags=_re.MULTILINE)
+    # Remove numbered list markers (1. 2. etc)
+    s = _re.sub(r'^\s*\d+\.\s+', '', s, flags=_re.MULTILINE)
+    # Remove blockquotes
+    s = _re.sub(r'^\s*>\s?', '', s, flags=_re.MULTILINE)
+    # Remove horizontal rules
+    s = _re.sub(r'^[-*_]{3,}\s*$', '', s, flags=_re.MULTILINE)
+    # Clean up extra whitespace
+    s = _re.sub(r'\n{3,}', '\n\n', s)
+    print(f"[Strip] Output: {s.strip()[:60]}...")
+    return s.strip()
+
+
 # Connected canvas display clients
 _canvas_clients: set[WebSocket] = set()
 
@@ -478,6 +574,7 @@ async def run_delegate(task: str):
         print(f"[Delegate] Error calling Opus: {e}")
         full_text = "Sorry, I ran into a problem getting that answer."
     await _push_queue.put({"text": full_text, "skip_tts": False})
+
 
 
 async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt: str | None = None) -> AsyncIterator[tuple[str, str]]:
@@ -773,8 +870,8 @@ mount_auth_routes(app)
 
 @app.middleware("http")
 async def _auth_middleware(request, call_next):
-    # /push uses its own Bearer token auth — skip session cookie check
-    if request.url.path == "/push":
+    # /push and /webhook/* use their own Bearer token auth — skip session cookie check
+    if request.url.path == "/push" or request.url.path.startswith("/webhook/"):
         return await call_next(request)
     return await auth_middleware(request, call_next)
 
@@ -932,6 +1029,60 @@ async def push_endpoint(request: Request):
     return JSONResponse({"ok": True, "queued": True})
 
 
+@app.post("/webhook/cron-result")
+async def cron_result_webhook(request: Request):
+    """
+    Receive a cron finished-run event from OpenClaw and speak the result.
+
+    OpenClaw POSTs this when a cron job with delivery.mode="webhook" completes.
+    The agent running the job should be instructed to respond in plain spoken
+    English (no markdown, no bullet lists) since the output will be read aloud.
+
+    Auth: Bearer token (same as PUSH_SECRET).
+    Body: OpenClaw cron finished event JSON, e.g.:
+        {
+            "jobId": "...",
+            "action": "finished",
+            "status": "ok",
+            "summary": "The agent's spoken response here",
+            ...
+        }
+    """
+    from fastapi.responses import JSONResponse
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not PUSH_SECRET or token != PUSH_SECRET:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    job_id = body.get("jobId", "unknown")
+    status = body.get("status", "unknown")
+    summary = (body.get("summary") or "").strip()
+
+    print(f"[CronWebhook] Received finished event: jobId={job_id} status={status} summary_len={len(summary)}")
+
+    if status != "ok":
+        error = body.get("error", "unknown error")
+        print(f"[CronWebhook] Job failed: {error}")
+        await _push_queue.put({"text": f"The background task didn't complete. {error}", "skip_tts": False})
+        return JSONResponse({"ok": True, "note": "error forwarded to push queue"})
+
+    if not summary:
+        print(f"[CronWebhook] No summary in finished event, skipping")
+        return JSONResponse({"ok": True, "note": "no summary, skipped"})
+
+    if _is_silent_reply(summary):
+        print(f"[CronWebhook] Silent reply in summary, suppressing")
+        return JSONResponse({"ok": True, "note": "silent reply suppressed"})
+
+    await _push_queue.put({"text": summary, "skip_tts": False})
+    print(f"[CronWebhook] Queued summary for TTS ({len(summary)} chars)")
+    return JSONResponse({"ok": True, "queued": True})
+
+
 @app.get("/canvas")
 async def canvas_page():
     return HTMLResponse(CANVAS_PAGE)
@@ -992,6 +1143,7 @@ async def websocket_endpoint(ws: WebSocket):
         "wake_word": WAKE_WORD_KEYWORD if WAKE_WORD_ENABLED else None,
         "idle_timeout": IDLE_TIMEOUT_SEC,
         "noise_suppression": False,
+        "smart_turn": SMART_TURN_ENABLED,
     })
 
     # Client state: sleeping (wake word mode) or awake (VAD mode)
@@ -1101,7 +1253,8 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.send_json({"type": "stream_start"})
             await ws.send_json({"type": "token", "text": reply})
             try:
-                audio_out, _ = await loop.run_in_executor(None, synthesize, reply)
+                tts_text = strip_markdown_for_tts(reply)
+                audio_out, _ = await loop.run_in_executor(None, synthesize, tts_text)
                 await ws.send_json({"type": "audio_chunk", "data": base64.b64encode(audio_out).decode(), "sentence": reply, "index": 0})
             except Exception as e:
                 print(f"[TTS] Error: {e}")
@@ -1128,7 +1281,8 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.send_json({"type": "stream_start"})
             await ws.send_json({"type": "token", "text": reply})
             try:
-                audio_out, _ = await loop.run_in_executor(None, synthesize, reply)
+                tts_text = strip_markdown_for_tts(reply)
+                audio_out, _ = await loop.run_in_executor(None, synthesize, tts_text)
                 await ws.send_json({"type": "audio_chunk", "data": base64.b64encode(audio_out).decode(), "sentence": reply, "index": 0})
             except Exception as e:
                 print(f"[TTS] Error: {e}")
@@ -1229,7 +1383,8 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "text": "Speaking..."})
                 try:
                     tts_start = time.time()
-                    audio_out, sr = await loop.run_in_executor(None, synthesize, data)
+                    tts_text = strip_markdown_for_tts(data)
+                    audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                     tts_time = time.time() - tts_start
                     total_tts_time += tts_time
 
@@ -1401,7 +1556,8 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "text": "Speaking..."})
                 try:
                     tts_start = time.time()
-                    audio_out, sr = await loop.run_in_executor(None, synthesize, data)
+                    tts_text = strip_markdown_for_tts(data)
+                    audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                     tts_time = time.time() - tts_start
                     total_tts_time += tts_time
                     if cancel_event.is_set():
@@ -1598,7 +1754,8 @@ async def websocket_endpoint(ws: WebSocket):
                     if sentence and not cancel_event.is_set():
                         try:
                             tts_start = time.time()
-                            audio_out, sr = await loop.run_in_executor(None, synthesize, sentence)
+                            tts_text = strip_markdown_for_tts(sentence)
+                            audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                             tts_time = time.time() - tts_start
                             total_tts_time += tts_time
                             audio_b64 = base64.b64encode(audio_out).decode()
@@ -1611,7 +1768,8 @@ async def websocket_endpoint(ws: WebSocket):
         if buffer.strip() and not cancel_event.is_set():
             try:
                 tts_start = time.time()
-                audio_out, sr = await loop.run_in_executor(None, synthesize, buffer.strip())
+                tts_text = strip_markdown_for_tts(buffer.strip())
+                audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                 tts_time = time.time() - tts_start
                 total_tts_time += tts_time
                 audio_b64 = base64.b64encode(audio_out).decode()
@@ -1676,6 +1834,25 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg["type"] == "audio":
                 # Full audio utterance (from VAD or manual recording)
+                audio_bytes = base64.b64decode(msg["data"])
+
+                # SmartTurn: check if user is done speaking before processing
+                if SMART_TURN_ENABLED and not msg.get("force", False):
+                    try:
+                        is_complete, prob = await loop.run_in_executor(
+                            None, predict_turn_complete, audio_bytes
+                        )
+                        print(f"[SmartTurn] prob={prob:.3f} complete={is_complete}")
+                        if not is_complete:
+                            # User likely mid-thought — tell browser to keep listening
+                            await ws.send_json({
+                                "type": "keep_listening",
+                                "probability": round(prob, 3),
+                            })
+                            continue
+                    except Exception as e:
+                        print(f"[SmartTurn] Error: {e}, proceeding anyway")
+
                 # Cancel any existing processing
                 if processing_task and not processing_task.done():
                     cancel_event.set()
@@ -1684,7 +1861,6 @@ async def websocket_endpoint(ws: WebSocket):
                     except asyncio.TimeoutError:
                         processing_task.cancel()
 
-                audio_bytes = base64.b64decode(msg["data"])
                 processing_task = asyncio.create_task(process_audio(audio_bytes))
 
             elif msg["type"] == "audio_stream":

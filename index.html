@@ -430,8 +430,8 @@
 </div>
 
 <!-- VAD library -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
 
 <script>
 const SAMPLE_RATE = 16000;
@@ -457,6 +457,10 @@ let isProcessing = false;     // Waiting for LLM response
 let isSpeaking = false;       // Audio is playing
 let wakeWordName = null;
 let idleTimeout = 30;
+let smartTurnBuffer = null;   // Accumulated Float32Array across keep_listening cycles
+let smartTurnTimer = null;    // Force-send timer when user stays silent after keep_listening
+let lastSentAudio = null;     // Last audio sent to server (for keep_listening recovery)
+const SMART_TURN_MAX_WAIT = 3000; // ms — force-send after this silence
 
 // Wake word streaming
 let streamingAudioContext = null;
@@ -640,6 +644,27 @@ function connect() {
       // Server says go back to sleep
       console.log('[State] Server requested sleep');
       handleSleep();
+    } else if (msg.type === 'keep_listening') {
+      // SmartTurn says user isn't done — keep VAD active, accumulate audio
+      console.log(`[SmartTurn] Keep listening (prob=${msg.probability})`);
+      setStatus('Still listening...', 'listening');
+      isProcessing = false;
+      // The audio we just sent needs to be kept — but it was already encoded.
+      // We need to reconstruct it. Instead, re-accumulate from what sendAudio sent.
+      // Since sendAudio already combined smartTurnBuffer + new audio into `combined`,
+      // and sent it, we need to save that. We'll store the last sent audio.
+      if (lastSentAudio) {
+        smartTurnBuffer = lastSentAudio;
+        lastSentAudio = null;
+      }
+      // Start a force-send timer in case user stays completely silent
+      if (smartTurnTimer) clearTimeout(smartTurnTimer);
+      smartTurnTimer = setTimeout(() => {
+        console.log('[SmartTurn] Max wait reached, force-sending');
+        if (smartTurnBuffer) {
+          sendAudio(new Float32Array(0), true);
+        }
+      }, SMART_TURN_MAX_WAIT);
     } else if (msg.type === 'status') {
       setStatus(msg.text, 'active');
     } else if (msg.type === 'transcript') {
@@ -991,11 +1016,13 @@ async function initVAD() {
     });
     vadInstance = await vad.MicVAD.new({
       stream: vadStream,
+      baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/",
+      onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
       positiveSpeechThreshold: 0.9,
       negativeSpeechThreshold: 0.35,
-      minSpeechFrames: 8,
-      preSpeechPadFrames: 10,
-      redemptionFrames: 20,
+      minSpeechMs: 256,
+      preSpeechPadMs: 320,
+      redemptionMs: 640,
       onFrameProcessed: (probs) => {
         // Use VAD speech probability as audio level proxy
         updateAudioLevel(probs.isSpeech * 0.5);
@@ -1043,10 +1070,27 @@ function stopVAD() {
 }
 
 // ---- Send audio to server ----
-function sendAudio(float32Audio) {
-  const int16 = new Int16Array(float32Audio.length);
-  for (let i = 0; i < float32Audio.length; i++) {
-    int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32Audio[i] * 32767)));
+function sendAudio(float32Audio, force = false) {
+  // Accumulate with any previous SmartTurn buffer
+  let combined = float32Audio;
+  if (smartTurnBuffer) {
+    const merged = new Float32Array(smartTurnBuffer.length + float32Audio.length);
+    merged.set(smartTurnBuffer);
+    merged.set(float32Audio, smartTurnBuffer.length);
+    combined = merged;
+    smartTurnBuffer = null;
+  }
+  if (smartTurnTimer) {
+    clearTimeout(smartTurnTimer);
+    smartTurnTimer = null;
+  }
+
+  // Save combined audio for keep_listening recovery
+  lastSentAudio = combined;
+
+  const int16 = new Int16Array(combined.length);
+  for (let i = 0; i < combined.length; i++) {
+    int16[i] = Math.max(-32768, Math.min(32767, Math.round(combined[i] * 32767)));
   }
 
   const b64 = arrayBufferToBase64(int16.buffer);
@@ -1064,7 +1108,7 @@ function sendAudio(float32Audio) {
     ws.send(JSON.stringify({ type: 'meeting_audio', data: b64 }));
     setStatus('Meeting mode — listening...', 'listening');
   } else {
-    ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+    ws.send(JSON.stringify({ type: 'audio', data: b64, force: force }));
     isProcessing = true;
     setStatus('Processing...', 'active');
   }
