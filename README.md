@@ -53,7 +53,7 @@ Override auto-detection with `KISMET_PLATFORM=mlx|cuda|cpu` or set `STT_BACKEND`
 - **TTS Skip When Voice Disabled** — toggling voice off skips TTS synthesis server-side (saves CPU/GPU) and suppresses audio playback on the client
 - **Tool Activity Indicator** — shows "Using tools..." when the LLM is running tools
 - **Pipeline Timing** — STT, LLM TTFT, LLM total, and TTS latency metrics
-- **Configurable LLM model** — set model via `OPENCLAW_MODEL` env var
+- **Configurable LLM model** — set model via `LLM_MODEL` env var
 - **Local processing** — STT, TTS, wake word, noise suppression, and speaker verify all run locally
 
 ## Requirements
@@ -109,17 +109,15 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in your values:
+Create a `.env` file and fill in your values:
 
 ### Core
 
 | Variable | Default | Description |
 |---|---|---|
 | `KISMET_PLATFORM` | *(auto-detect)* | Force platform: `mlx`, `cuda`, or `cpu` |
-| `OPENCLAW_URL` | `http://127.0.0.1:18789/v1/chat/completions` | OpenClaw endpoint |
-| `OPENCLAW_TOKEN` | — | Gateway auth token |
-| `OPENCLAW_AGENT` | `main` | Agent ID to route to |
 | `SYSTEM_PROMPT` | *(built-in)* | System prompt for voice responses |
+| `MEETING_SYSTEM_PROMPT` | *(built-in)* | System prompt used for meeting command responses |
 
 ### STT
 
@@ -129,6 +127,7 @@ Copy `.env.example` to `.env` and fill in your values:
 | `MLX_STT_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | MLX STT model (Parakeet) |
 | `WHISPER_MODEL` | `large-v3` | faster-whisper model size |
 | `WHISPER_DEVICE` | `cuda` | Device for faster-whisper (`cuda`, `cpu`) |
+| `WHISPER_COMPUTE` | `float16` | Compute type for faster-whisper |
 
 ### TTS
 
@@ -140,19 +139,17 @@ Copy `.env.example` to `.env` and fill in your values:
 | `MLX_TTS_MODEL_FALLBACK` | `mlx-community/Kokoro-82M-bf16` | Fallback MLX TTS model |
 | `MLX_TTS_VOICE` | `af_sky` | Voice ID for MLX Kokoro |
 | `CHATTERBOX_REF` | — | Reference audio for voice cloning |
-| `KOKORO_VOICE` | `af_heart` | Kokoro ONNX voice ID |
+| `KOKORO_VOICE` | `af_sky` | Kokoro ONNX voice ID |
 
 ### Wake Word & Speaker Verification
 
 | Variable | Default | Description |
 |---|---|---|
 | `WAKE_WORD_ENABLED` | `true` | Enable wake word detection |
-| `WAKE_WORD` | `hey_friday` | Wake word name |
+| `WAKE_WORD_KEYWORD` | `jarvis` | Built-in keyword name or path to custom `.ppn` |
 | `PORCUPINE_ACCESS_KEY` | — | Picovoice access key (required) |
-| `PORCUPINE_MODEL_PATH` | — | Path to custom `.ppn` wake word file |
-| `WAKE_WORD_THRESHOLD` | `0.5` | Wake word detection sensitivity |
+| `WAKE_WORD_SENSITIVITY` | `0.5` | Wake word detection sensitivity |
 | `SPEAKER_VERIFY` | `auto` | Speaker verification (`auto`, `true`, `false`) |
-| `SPEAKER_VERIFY_THRESHOLD` | `0.65` | Cosine similarity threshold |
 | `IDLE_TIMEOUT_SEC` | `30` | Seconds before returning to sleep |
 
 ### Smart Turn (Endpoint Detection)
@@ -167,15 +164,40 @@ Copy `.env.example` to `.env` and fill in your values:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENCLAW_MODEL` | *(agent default)* | Override LLM model for voice requests |
+| `LLM_URL` | `http://127.0.0.1:1234/v1/chat/completions` | OpenAI-compatible chat completions endpoint |
+| `LLM_API_KEY` | — | Optional bearer token for the LLM endpoint |
+| `LLM_MODEL` | `nvidia/nemotron-3-nano` | Model name sent to the endpoint |
+| `MAX_HISTORY_MESSAGES` | `20` | Sliding window size for local conversation history |
+
+### Memory (Forgetful RAG)
+
+| Variable | Default | Description |
+|---|---|---|
+| `FORGETFUL_ENABLED` | `true` | Enable Forgetful semantic memory injection |
+| `FORGETFUL_MAX_MEMORIES` | `3` | Top-K memories to inject per request |
+| `FORGETFUL_MAX_CONTENT_CHARS` | `300` | Truncate each injected memory to this length |
+
+### Push & Delegation
+
+| Variable | Default | Description |
+|---|---|---|
+| `PUSH_SECRET` | — | Bearer token required by `/push` and `/webhook/*` |
+| `PUSH_URL` | `https://prodigy.skunk-shark.ts.net:8765/push` | Public push endpoint URL used by delegated tools |
+| `DELEGATE_ENABLED` | `true` | Enable external delegation tool |
+| `DELEGATE_USE_ACP` | `true` | Prefer persistent `opencode acp` transport (falls back to `opencode run` on error) |
+| `DELEGATE_CMD` | `opencode` | Delegate CLI command |
+| `DELEGATE_MODEL` | `opencode/mimo-v2-pro-free` | Model passed to the delegate CLI |
+| `DELEGATE_TIMEOUT` | `120` | Delegate timeout in seconds |
 
 ### Authentication
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEBAUTHN_RP_ID` | `localhost` | WebAuthn relying party ID (your domain) |
-| `WEBAUTHN_RP_NAME` | `Kismet Voice` | Display name for passkey prompts |
-| `WEBAUTHN_ORIGIN` | `https://localhost:8765` | Expected WebAuthn origin |
+| `AUTH_SECRET` | *(random at startup)* | Secret used to sign auth session cookies |
+| `AUTH_SESSION_HOURS` | `24` | Auth session lifetime in hours |
+| `WEBAUTHN_RP_ID` | *(auto from request host)* | WebAuthn relying party ID override |
+| `WEBAUTHN_RP_NAME` | `Kismet Voice Agent` | Display name for passkey prompts |
+| `WEBAUTHN_ORIGIN` | *(auto from request host/scheme)* | Expected WebAuthn origin override |
 
 ## Usage
 

@@ -6,10 +6,11 @@
 
 Two-part application (NOT a monorepo):
 - **Backend** — Python FastAPI server (`server.py`) with WebSocket-based voice pipeline
-  - `server.py` — main server: WebSocket handler, STT/TTS/LLM pipeline, audio streaming
+  - `server.py` — main server: WebSocket handler, STT/TTS/LLM pipeline, audio streaming, Harmony filter, delegate execution, push/webhook endpoints
   - `platform_config.py` — auto-detects hardware (MLX/CUDA/CPU), sets backend defaults
   - `auth.py` — WebAuthn (passkey/Touch ID) authentication, session cookies
   - `speaker_verify.py` — SpeechBrain ECAPA-TDNN speaker verification
+  - `session_memory.py` — SQLite-based session message persistence (`data/session_memory.db`)
 - **Frontend** — React 19 + TypeScript + Vite app in `frontend/`
   - Built to `frontend/dist/`, served by the Python backend
   - Communicates with backend via WebSocket at `/ws`
@@ -171,10 +172,23 @@ Path alias: `@/*` maps to `src/*` (configured in tsconfig + vite). Use for deep 
 | `OPENCLAW_URL` | `http://127.0.0.1:18789/v1/chat/completions` | LLM endpoint |
 | `OPENCLAW_TOKEN` | — | Gateway auth token |
 | `OPENCLAW_AGENT` | `main` | Agent ID |
+| `OPENCLAW_MODEL` | *(agent default)* | Override LLM model for voice requests |
 | `STT_BACKEND` | auto | `mlx-audio` or `faster-whisper` |
 | `TTS_BACKEND` | auto | `mlx-audio`, `chatterbox-cuda`, or `kokoro-onnx` |
 | `WAKE_WORD_ENABLED` | `true` | Enable wake word detection |
 | `SPEAKER_VERIFY` | `auto` | Speaker verification mode |
+| `SMART_TURN_ENABLED` | `true` | SmartTurn endpoint detection |
+| `SMART_TURN_THRESHOLD` | `0.5` | Probability threshold for turn-complete (0-1) |
+| `SMART_TURN_MAX_WAIT_SEC` | `3.0` | Force-send after this silence duration |
+| `FORGETFUL_ENABLED` | `true` | Enable Forgetful RAG memory injection |
+| `FORGETFUL_MAX_MEMORIES` | `3` | Top-K memories to inject per request |
+| `FORGETFUL_MAX_CONTENT_CHARS` | `300` | Truncate each memory's content |
+| `DELEGATE_ENABLED` | `true` | Enable tool delegation via CLI |
+| `DELEGATE_CMD` | `opencode` | CLI command for delegate execution |
+| `DELEGATE_MODEL` | `opencode/mimo-v2-pro-free` | Model for delegate agent |
+| `DELEGATE_TIMEOUT` | `120` | Delegate timeout in seconds |
+| `PUSH_SECRET` | — | Bearer token for push/webhook endpoints |
+| `PUSH_URL` | `https://prodigy.skunk-shark.ts.net:8765/push` | Push notification URL |
 
 ## Git Conventions
 

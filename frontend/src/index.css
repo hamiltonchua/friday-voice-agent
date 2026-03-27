@@ -629,6 +629,35 @@ header h1 { font-size: 1.5rem; font-weight: 600; }
   margin-bottom: 3px;
 }
 .msg-row .msg-text { color: var(--text); }
+.msg-rich { display: flex; flex-direction: column; gap: 8px; }
+.msg-paragraph { margin: 0; }
+.msg-list { margin: 0 0 0 20px; }
+.msg-list li { margin: 2px 0; }
+.msg-list-ul { list-style: disc; }
+.msg-list-ol { list-style: decimal; }
+.msg-table-wrap {
+  overflow-x: auto;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px;
+}
+.msg-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 320px;
+}
+.msg-table th,
+.msg-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  text-align: left;
+  vertical-align: top;
+}
+.msg-table th {
+  color: var(--green);
+  background: rgba(15, 52, 96, 0.35);
+  font-weight: 600;
+}
+.msg-table tr:last-child td { border-bottom: none; }
 .msg-row.streaming { border-left-color: var(--accent); }
 .msg-row.streaming .msg-text::after {
   content: '▋';

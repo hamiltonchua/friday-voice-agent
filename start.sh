@@ -10,7 +10,7 @@ export KOKORO_VOICE="${KOKORO_VOICE:-af_heart}"
 
 echo "🔨 Starting Friday Voice Chat"
 echo "   STT: faster-whisper ($WHISPER_MODEL on $WHISPER_DEVICE)"
-echo "   LLM: OpenClaw → Friday (localhost:18789)"
+echo "   LLM: LM Studio (localhost:1234)"
 echo "   TTS: Kokoro ($KOKORO_VOICE)"
 echo "   URL: https://localhost:8765"
 echo ""

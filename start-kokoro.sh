@@ -35,8 +35,8 @@ export SMART_TURN_ENABLED=${SMART_TURN_ENABLED:-true}
 export SMART_TURN_THRESHOLD=${SMART_TURN_THRESHOLD:-0.5}
 export SMART_TURN_MAX_WAIT_SEC=${SMART_TURN_MAX_WAIT_SEC:-3.0}
 
-# Inherit gateway token from system env so it stays current after rotations
-export OPENCLAW_TOKEN="${OPENCLAW_TOKEN:-$OPENCLAW_GATEWAY_TOKEN}"
+# LLM API key (optional — most local servers don't need auth)
+# export LLM_API_KEY="${LLM_API_KEY:-}"
 
 # Unbuffered output for logging
 export PYTHONUNBUFFERED=1

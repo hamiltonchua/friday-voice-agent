@@ -69,7 +69,7 @@ SMART_TURN_MAX_WAIT_SEC = float(os.getenv("SMART_TURN_MAX_WAIT_SEC", "3.0"))  # 
 # LLM backend (OpenAI-compatible API — LM Studio, Ollama, vLLM, etc.)
 LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:1234/v1/chat/completions")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")  # Optional — most local servers don't need auth
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
+LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano")
 
 # Conversation history — LM Studio is stateless, so we manage context locally
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))  # Sliding window size (user+assistant pairs)
@@ -83,6 +83,13 @@ SPEAKER_VERIFY = os.getenv("SPEAKER_VERIFY", "auto")  # "true", "false", or "aut
 # Push endpoint — allows sub-agents to POST results back to the voice UI
 PUSH_SECRET = os.getenv("PUSH_SECRET", "")
 PUSH_URL = os.getenv("PUSH_URL", "https://prodigy.skunk-shark.ts.net:8765/push")
+
+# Delegation — gpt-oss can delegate tasks to an external AI via `opencode run`
+DELEGATE_CMD = os.getenv("DELEGATE_CMD", "opencode")
+DELEGATE_MODEL = os.getenv("DELEGATE_MODEL", "opencode/mimo-v2-pro-free")
+DELEGATE_TIMEOUT = int(os.getenv("DELEGATE_TIMEOUT", "120"))  # seconds
+DELEGATE_ENABLED = os.getenv("DELEGATE_ENABLED", "true").lower() == "true"
+DELEGATE_USE_ACP = os.getenv("DELEGATE_USE_ACP", "true").lower() == "true"
 
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
@@ -128,6 +135,31 @@ CANVAS_INSTRUCTION = (
     "ALWAYS use canvas blocks for visual data. Do NOT describe tables/charts verbally — show them on canvas."
 )
 
+# Harmony format: channel instructions for gpt-oss models
+# These are included in the system message content — LM Studio's chat template
+# wraps them into proper Harmony <|start|>system<|message|>...<|end|> tokens.
+HARMONY_CHANNEL_INSTRUCTIONS = (
+    "\n\n# Valid channels: analysis, commentary, final. "
+    "Channel must be included for every message.\n"
+    "Calls to these tools must go to the commentary channel: 'functions'."
+)
+
+# Tool definitions in Harmony's TypeScript namespace syntax
+# Included in a developer-role message (or system message if LM Studio doesn't support developer role)
+HARMONY_TOOL_DEFS = (
+    "\n\n# Tools\n\n"
+    "## functions\n\n"
+    "namespace functions {\n\n"
+    "// Delegates a task to an external AI assistant for research, up-to-date information,\n"
+    "// or complex analysis beyond your local knowledge.\n"
+    "// The result will be returned to you so you can summarize it for the user.\n"
+    "type delegate = (_: {\n"
+    "// The complete question or task to delegate, with full context\n"
+    "task: string,\n"
+    "}) => any;\n\n"
+    "} // namespace functions"
+)
+
 # ---------------------------------------------------------------------------
 # Global singletons
 # ---------------------------------------------------------------------------
@@ -147,6 +179,7 @@ _memory_fetch_task: asyncio.Task | None = None  # In-flight background memory qu
 _model_lock = threading.Lock()  # Prevent concurrent MLX/GPU model loads
 _models_ready = False  # True once startup preload completes
 _deepfilter_available = True  # Set to False if import fails
+_delegate_acp_client = None  # Lazy-created OpencodeACPClient singleton
 
 # Persistent HTTP client — reuses TCP connections to LLM server (avoids
 # per-request connection setup overhead of ~50-200ms). Created at module level,
@@ -255,9 +288,17 @@ def consume_memory_context() -> str:
     return ctx
 
 
+def _is_harmony_model() -> bool:
+    """Check if the configured LLM model uses Harmony format."""
+    return "gpt-oss" in LLM_MODEL.lower()
+
+
 def _build_system_prompt(base_prompt: str, memory_context: str) -> str:
     """Build system prompt with optional memory context injection."""
     parts = [base_prompt.strip()]
+    # Add Harmony channel instructions for gpt-oss models
+    if _is_harmony_model():
+        parts[0] += HARMONY_CHANNEL_INSTRUCTIONS
     if memory_context:
         parts.append(
             "Relevant memory:\n"
@@ -266,6 +307,9 @@ def _build_system_prompt(base_prompt: str, memory_context: str) -> str:
             "If it seems unrelated, ignore it."
         )
     parts.append(VOICE_OUTPUT_RULES)
+    # Add tool definitions for Harmony models with delegation enabled
+    if _is_harmony_model() and DELEGATE_ENABLED:
+        parts.append(HARMONY_TOOL_DEFS)
     return "\n\n".join(parts)
 
 
@@ -571,13 +615,42 @@ def extract_canvas_blocks(text: str) -> tuple[str, list[dict]]:
     return cleaned, blocks
 
 
-def strip_markdown_for_tts(text: str) -> str:
+def strip_markdown_for_tts(text: str, spoken_structures: set[str] | None = None) -> str:
     """Strip markdown formatting from text for clean TTS output.
     Removes: bold/italic markers, headers, code blocks, bullet points, links, etc.
     Preserves the actual content text."""
     import re as _re
     print(f"[Strip] Input: {text[:60]}...")
     s = text
+    lines = [line.rstrip() for line in s.splitlines()]
+
+    # If a markdown table is detected, speak a concise cue once.
+    has_table = False
+    for i in range(len(lines) - 1):
+        if "|" not in lines[i] or "|" not in lines[i + 1]:
+            continue
+        if _re.match(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$', lines[i + 1]):
+            has_table = True
+            break
+    if has_table:
+        if spoken_structures is not None:
+            if "table" in spoken_structures:
+                return ""
+            spoken_structures.add("table")
+        return "I displayed that in a table below."
+
+    # If a markdown list is detected, speak a concise cue once.
+    has_list = any(
+        _re.match(r'^\s*(?:[-*+]\s+|\d+\.\s+)', line)
+        for line in lines
+        if line.strip()
+    )
+    if has_list:
+        if spoken_structures is not None:
+            if "list" in spoken_structures:
+                return ""
+            spoken_structures.add("list")
+        return "I displayed that as a list below."
     # Remove code blocks (``` ... ```)
     s = _re.sub(r'```[\s\S]*?```', '', s)
     # Remove inline code (`...`)
@@ -603,8 +676,16 @@ def strip_markdown_for_tts(text: str) -> str:
     s = _re.sub(r'^\s*>\s?', '', s, flags=_re.MULTILINE)
     # Remove horizontal rules
     s = _re.sub(r'^[-*_]{3,}\s*$', '', s, flags=_re.MULTILINE)
+    # Remove table separators and loose pipe delimiters that sound noisy in TTS
+    s = _re.sub(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$', '', s, flags=_re.MULTILINE)
+    s = s.replace('|', ' ')
+    # Keep parenthetical content but strip the symbols themselves
+    s = s.replace('(', ', ').replace(')', '')
     # Clean up extra whitespace
+    s = _re.sub(r'[ \t]+', ' ', s)
     s = _re.sub(r'\n{3,}', '\n\n', s)
+    s = _re.sub(r'\s+([,.;:!?])', r'\1', s)
+    s = _re.sub(r',\s*,+', ', ', s)
     print(f"[Strip] Output: {s.strip()[:60]}...")
     return s.strip()
 
@@ -650,6 +731,9 @@ class HarmonyFilter:
         self._passthrough = False  # True once we confirm non-Harmony output
         self._harmony = False      # True once Harmony tokens detected (never reverts)
         self._emitting = False     # True when inside final channel content
+        self._tool_calls = []  # List of (tool_name, content_type, arguments_json)
+        self._current_recipient = None  # e.g. "functions.delegate"
+        self._current_constrain = None  # e.g. "json"
 
     def feed(self, token: str) -> str:
         """Feed a streaming token. Returns text to emit (empty if suppressed)."""
@@ -723,20 +807,539 @@ class HarmonyFilter:
                         self._buf = self._buf[idx:]
                         break
                 else:
-                    # No final channel — discard accumulated non-final content
-                    if len(self._buf) > 30:
-                        self._buf = self._buf[-20:]
+                    # No final channel — check for tool calls
+                    # Only attempt match when <|message|> is present AND has content after it
+                    msg_pos = self._buf.find("<|message|>")
+                    if msg_pos == -1:
+                        # Pattern incomplete — keep buffering, wait for more tokens
+                        break
+                    msg_end = msg_pos + len("<|message|>")
+                    if msg_end == len(self._buf):
+                        # <|message|> at buffer end — content hasn't arrived yet
+                        break
+                    # Don't parse tool payload until we see a closing Harmony marker.
+                    # Without this, we can capture partial JSON like '{"' mid-stream.
+                    tail = self._buf[msg_end:]
+                    end_idx = len(tail)
+                    end_len = 0
+                    for marker in ("<|call|>", "<|end|>", "<|return|>", "<|start|>"):
+                        idx = tail.find(marker)
+                        if idx != -1 and idx < end_idx:
+                            end_idx = idx
+                            end_len = len(marker)
+                    if end_len == 0:
+                        break
+                    payload = tail[:end_idx]
+                    header = self._buf[:msg_end]
+                    parsed = self._parse_tool_call(header, payload)
+                    if parsed is not None:
+                        recipient, constrain, content = parsed
+                        self._current_recipient = recipient
+                        self._current_constrain = constrain
+                        self._tool_calls.append((recipient, constrain, content))
+                        self._buf = tail[end_idx + end_len:]
+                        break
+                    # Also check for legacy delegation pattern without explicit tool name
+                    # e.g. <|channel|>commentary to=delegate
+                    delegate_match = re.search(
+                        r'to=delegate\b.*?<\|message\|>(.*)',
+                        self._buf[:msg_end] + payload, re.DOTALL
+                    )
+                    if delegate_match and delegate_match.group(1):
+                        content = _HARMONY_CTRL_RE.sub("", delegate_match.group(1)).strip()
+                        self._current_recipient = "functions.delegate"
+                        self._current_constrain = "json"
+                        self._tool_calls.append(("functions.delegate", "json", content))
+                        self._buf = tail[end_idx + end_len:]
+                        break
+                    # <|message|> present but no tool pattern matched yet — keep buffering
                     break
         return output
 
+    def _parse_tool_call(self, header: str, payload: str) -> tuple[str, str, str] | None:
+        """Best-effort parse of Harmony commentary tool calls across header variants."""
+        if "<|channel|>commentary" not in header:
+            return None
+
+        raw_content = _HARMONY_CTRL_RE.sub("", payload).strip()
+        if not raw_content:
+            return None
+
+        to_match = re.search(r'\bto=([^\s<]+)', header)
+        recipient = to_match.group(1).strip() if to_match else ""
+
+        constrain_match = re.search(r'<\|constrain\|>([^<\s]+)', header)
+        constrain = (constrain_match.group(1).strip() if constrain_match else "text")
+
+        # Recipient may appear in role position after <|start|>.
+        if not recipient:
+            start_role_match = re.search(r'<\|start\|>\s*([^\s<]+)', header)
+            if start_role_match:
+                candidate = start_role_match.group(1).strip()
+                if candidate in ("delegate", "functions.delegate") or candidate.startswith("functions."):
+                    recipient = candidate
+
+        # Some outputs incorrectly place tool name in constrain slot.
+        if not recipient and constrain in ("delegate", "functions.delegate"):
+            recipient = "functions.delegate"
+            constrain = "json"
+        elif not recipient and constrain.startswith("functions."):
+            recipient = constrain
+            constrain = "json"
+
+        # If recipient is still missing, only default to delegate when payload looks like tool args.
+        if not recipient:
+            looks_like_json = raw_content.startswith("{") or raw_content.startswith("[")
+            looks_like_task = '"task"' in raw_content or "'task'" in raw_content
+            if looks_like_json or looks_like_task:
+                recipient = "functions.delegate"
+                if constrain == "text":
+                    constrain = "json"
+            else:
+                # likely commentary preamble, not a tool call
+                return None
+
+        if recipient == "delegate":
+            recipient = "functions.delegate"
+
+        return recipient, constrain or "text", raw_content
+
     def flush(self) -> str:
         """Flush remaining buffer at end of stream."""
+        # Catch tool calls if stream ended without <|call|> stop token.
+        msg_pos = self._buf.find("<|message|>")
+        if msg_pos != -1:
+            msg_end = msg_pos + len("<|message|>")
+            parsed = self._parse_tool_call(self._buf[:msg_end], self._buf[msg_end:])
+            if parsed is not None:
+                recipient, constrain, content = parsed
+                self._current_recipient = recipient
+                self._current_constrain = constrain
+                self._tool_calls.append((recipient, constrain, content))
+                self._buf = ""
+                return ""
+
+        delegate_match = re.search(
+            r'to=delegate\b.*?<\|message\|>(.*)',
+            self._buf, re.DOTALL
+        )
+        if delegate_match and delegate_match.group(1):
+            content = _HARMONY_CTRL_RE.sub("", delegate_match.group(1)).strip()
+            self._current_recipient = "functions.delegate"
+            self._current_constrain = "json"
+            self._tool_calls.append(("functions.delegate", "json", content))
+            self._buf = ""
+            return ""
+
         if self._passthrough or self._emitting:
             out = _HARMONY_CTRL_RE.sub("", self._buf)
             self._buf = ""
             return out.strip()
         self._buf = ""
         return ""
+
+    @property
+    def tool_calls(self) -> list:
+        """Return detected tool calls: [(recipient, constrain_type, content), ...]"""
+        return self._tool_calls
+
+
+async def call_delegated_agent(task: str) -> str:
+    """Delegate a task to an external AI agent via ACP (preferred) or CLI fallback."""
+    if DELEGATE_USE_ACP:
+        try:
+            return await call_delegated_agent_acp(task)
+        except Exception as e:
+            print(f"[Tool] ACP delegation failed, falling back to CLI: {e}")
+    return await call_delegated_agent_cli(task)
+
+
+class OpencodeACPClient:
+    """Minimal ACP JSON-RPC client over stdio for a persistent opencode session."""
+
+    def __init__(self, cmd_path: str, cwd: str):
+        self._cmd_path = cmd_path
+        self._cwd = cwd
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._next_id = 1
+        self._pending: dict[int, asyncio.Future] = {}
+        self._session_id: str | None = None
+        self._updates_by_session: dict[str, list[str]] = {}
+        self._session_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._failed_until = 0.0
+
+    async def _read_stdout(self):
+        assert self._proc and self._proc.stdout
+        while True:
+            line = await self._proc.stdout.readline()
+            if not line:
+                break
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                print(f"[ACP] Non-JSON line: {raw[:200]}")
+                continue
+            msg_id = msg.get("id")
+            if isinstance(msg_id, int):
+                fut = self._pending.get(msg_id)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+                continue
+            method = msg.get("method")
+            if method == "session/update":
+                params = msg.get("params", {})
+                session_id = params.get("sessionId")
+                if isinstance(session_id, str):
+                    text = self._extract_update_text(params.get("update"))
+                    if text:
+                        self._updates_by_session.setdefault(session_id, []).append(text)
+
+    async def _read_stderr(self):
+        assert self._proc and self._proc.stderr
+        while True:
+            line = await self._proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                print(f"[ACP] {text}")
+
+    def _extract_update_text(self, update: object) -> str:
+        parts: list[str] = []
+
+        def walk(obj: object):
+            if isinstance(obj, dict):
+                text_val = obj.get("text")
+                if isinstance(text_val, str) and text_val.strip():
+                    parts.append(text_val)
+                for k, v in obj.items():
+                    if k == "text":
+                        continue
+                    walk(v)
+                return
+            if isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(update)
+        return "".join(parts).strip()
+
+    def _extract_result_text(self, result: object) -> str:
+        parts: list[str] = []
+
+        def walk(obj: object):
+            if isinstance(obj, dict):
+                text_val = obj.get("text")
+                if isinstance(text_val, str) and text_val.strip():
+                    parts.append(text_val)
+                content_val = obj.get("content")
+                if isinstance(content_val, str) and content_val.strip():
+                    parts.append(content_val)
+                for k, v in obj.items():
+                    if k in ("text", "content"):
+                        continue
+                    walk(v)
+                return
+            if isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(result)
+        return "".join(parts).strip()
+
+    async def _request(self, method: str, params: dict, timeout_sec: float) -> dict:
+        if not self._proc or not self._proc.stdin:
+            raise RuntimeError("ACP process not running")
+        req_id = self._next_id
+        self._next_id += 1
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+        payload = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params,
+        }
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        async with self._write_lock:
+            self._proc.stdin.write(data)
+            await self._proc.stdin.drain()
+        try:
+            msg = await asyncio.wait_for(fut, timeout=timeout_sec)
+        finally:
+            self._pending.pop(req_id, None)
+        if "error" in msg:
+            err = msg["error"]
+            raise RuntimeError(f"ACP {method} error: {err}")
+        return msg.get("result", {})
+
+    async def ensure_started(self):
+        async with self._start_lock:
+            if self._proc and self._proc.returncode is None and self._session_id:
+                return
+            if time.time() < self._failed_until:
+                raise RuntimeError("ACP startup is in cooldown after previous failure")
+
+            self._proc = await asyncio.create_subprocess_exec(
+                self._cmd_path,
+                "acp",
+                "--cwd",
+                self._cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._reader_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
+            try:
+                init_payloads = [
+                    {"protocolVersion": 1},
+                    {"protocolVersion": 1, "client": {"name": "kismet-voice-agent", "version": "0.1.0"}},
+                    {"protocolVersion": 1, "clientInfo": {"name": "kismet-voice-agent", "version": "0.1.0"}},
+                ]
+                last_init_error: Exception | None = None
+                for payload in init_payloads:
+                    try:
+                        await self._request("initialize", payload, timeout_sec=10.0)
+                        last_init_error = None
+                        break
+                    except Exception as e:
+                        last_init_error = e
+                if last_init_error is not None:
+                    raise last_init_error
+                session_payloads = [
+                    {"cwd": self._cwd, "mcpServers": []},
+                    {"mcpServers": [], "cwd": self._cwd},
+                    {"mcpServers": []},
+                ]
+                last_session_error: Exception | None = None
+                session_result: dict = {}
+                for payload in session_payloads:
+                    try:
+                        session_result = await self._request("session/new", payload, timeout_sec=10.0)
+                        last_session_error = None
+                        break
+                    except Exception as e:
+                        last_session_error = e
+                if last_session_error is not None:
+                    raise last_session_error
+                session_id = session_result.get("sessionId")
+                if not isinstance(session_id, str) or not session_id:
+                    raise RuntimeError(f"ACP session/new missing sessionId: {session_result}")
+                self._session_id = session_id
+                print(f"[ACP] Connected session={session_id}")
+            except Exception:
+                await self.close()
+                self._failed_until = time.time() + 60.0
+                raise
+
+    async def prompt(self, task: str, model: str, timeout_sec: float) -> str:
+        await self.ensure_started()
+        if not self._session_id:
+            raise RuntimeError("ACP session unavailable")
+        async with self._session_lock:
+            session_id = self._session_id
+            self._updates_by_session[session_id] = []
+
+            # Best effort model switch. Ignore if not supported by agent.
+            try:
+                set_model_payloads = [
+                    {"sessionId": session_id, "modelId": model},
+                    {"sessionId": session_id, "model": model},
+                ]
+                set_model_error: Exception | None = None
+                for payload in set_model_payloads:
+                    try:
+                        await self._request(
+                            "session/set_model",
+                            payload,
+                            timeout_sec=5.0,
+                        )
+                        set_model_error = None
+                        break
+                    except Exception as e:
+                        set_model_error = e
+                if set_model_error is not None:
+                    raise set_model_error
+            except Exception as e:
+                print(f"[ACP] session/set_model not applied: {e}")
+
+            prompt_payloads = [
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": task}]},
+                {"sessionId": session_id, "content": [{"type": "text", "text": task}]},
+                {"sessionId": session_id, "prompt": [{"type": "input_text", "text": task}]},
+            ]
+            result: dict = {}
+            last_prompt_error: Exception | None = None
+            for payload in prompt_payloads:
+                try:
+                    result = await self._request(
+                        "session/prompt",
+                        payload,
+                        timeout_sec=timeout_sec,
+                    )
+                    last_prompt_error = None
+                    break
+                except Exception as e:
+                    last_prompt_error = e
+            if last_prompt_error is not None:
+                raise last_prompt_error
+
+            chunks = self._updates_by_session.pop(session_id, [])
+            text = "".join(chunks).strip()
+            if text:
+                return text
+            fallback_text = self._extract_result_text(result)
+            return fallback_text
+
+    async def close(self):
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
+        if self._proc:
+            if self._proc.returncode is None:
+                self._proc.terminate()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                except Exception:
+                    self._proc.kill()
+            self._proc = None
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        self._session_id = None
+
+
+def _get_delegate_acp_client(cmd_path: str) -> OpencodeACPClient:
+    global _delegate_acp_client
+    if _delegate_acp_client is None:
+        _delegate_acp_client = OpencodeACPClient(
+            cmd_path=cmd_path,
+            cwd=str(Path(__file__).parent),
+        )
+    return _delegate_acp_client
+
+
+async def call_delegated_agent_acp(task: str) -> str:
+    import shutil
+
+    cmd_path = shutil.which(DELEGATE_CMD)
+    if not cmd_path:
+        return f"Error: {DELEGATE_CMD} CLI not found. Install it or set DELEGATE_CMD env var."
+
+    t0 = time.time()
+    preview = task.replace("\n", "\\n")
+    if len(preview) > 240:
+        preview = preview[:240] + "..."
+    print(f"[Tool] Delegating via ACP (task_chars={len(task)}): {preview!r}")
+
+    client = _get_delegate_acp_client(cmd_path)
+    result = await client.prompt(task=task, model=DELEGATE_MODEL, timeout_sec=float(DELEGATE_TIMEOUT))
+    elapsed_ms = int((time.time() - t0) * 1000)
+    print(f"[Tool] ACP responded ({elapsed_ms}ms, {len(result)} chars)")
+    if len(result) > 4000:
+        result = result[:4000] + "\n\n[Response truncated at 4000 chars]"
+    return result
+
+
+async def call_delegated_agent_cli(task: str) -> str:
+    """Delegate a task to an external AI agent via opencode run."""
+    import shutil
+
+    cmd_path = shutil.which(DELEGATE_CMD)
+    if not cmd_path:
+        return f"Error: {DELEGATE_CMD} CLI not found. Install it or set DELEGATE_CMD env var."
+
+    t0 = time.time()
+    preview = task.replace("\n", "\\n")
+    if len(preview) > 240:
+        preview = preview[:240] + "..."
+    print(f"[Tool] Delegating to {DELEGATE_CMD} (task_chars={len(task)}): {preview!r}")
+
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        # Build command: opencode run -m <model> "task"
+        cmd_args = [cmd_path, "run", "-m", DELEGATE_MODEL, task]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=DELEGATE_TIMEOUT,
+        )
+        elapsed_ms = int((time.time() - t0) * 1000)
+        result = stdout.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            print(f"[Tool] {DELEGATE_CMD} failed (rc={proc.returncode}, {elapsed_ms}ms): {err[:200]}")
+            return f"Error: {DELEGATE_CMD} returned exit code {proc.returncode}. {err[:500]}"
+        print(f"[Tool] {DELEGATE_CMD} responded ({elapsed_ms}ms, {len(result)} chars)")
+        # Truncate very long responses to avoid blowing context
+        if len(result) > 4000:
+            result = result[:4000] + "\n\n[Response truncated at 4000 chars]"
+        return result
+    except asyncio.TimeoutError:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        print(f"[Tool] {DELEGATE_CMD} timed out after {elapsed_ms}ms")
+        if proc and proc.returncode is None:
+            proc.kill()
+        return f"Error: {DELEGATE_CMD} timed out after {DELEGATE_TIMEOUT}s"
+    except Exception as e:
+        print(f"[Tool] {DELEGATE_CMD} error: {e}")
+        return f"Error calling {DELEGATE_CMD}: {str(e)}"
+
+
+def _coerce_delegate_task(raw: object) -> str:
+    """Best-effort extraction of a delegate task from nested/malformed tool args."""
+    value: object = raw
+    for _ in range(3):
+        if isinstance(value, dict):
+            value = value.get("task", "")
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            # Handle cases where task is a JSON string containing {"task": "..."}.
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            value = decoded
+            continue
+        return str(value).strip()
+    return str(value).strip()
+
+
+async def execute_tool(tool_name: str, arguments: dict) -> str:
+    """Execute a Harmony tool call and return the result text."""
+    if tool_name == "functions.delegate" or tool_name == "delegate":
+        task = _coerce_delegate_task(arguments)
+        preview = task.replace("\n", "\\n")
+        if len(preview) > 240:
+            preview = preview[:240] + "..."
+        print(f"[Tool] Parsed delegate task chars={len(task)} from args keys={list(arguments.keys())}: {preview!r}")
+        if not task:
+            return "Error: No task provided for delegation."
+        if not DELEGATE_ENABLED:
+            return "Delegation is disabled. Answer based on your own knowledge."
+        return await call_delegated_agent(task)
+    else:
+        print(f"[Tool] Unknown tool: {tool_name}")
+        return f"Error: Unknown tool '{tool_name}'. Available tools: delegate"
 
 
 
@@ -773,116 +1376,175 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
     if len(conversation_history) > MAX_HISTORY_MESSAGES:
         conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
 
-    full_text = ""
-    buffer = ""
-    cancelled = False
-    got_first_token = False
-    working_emitted = False
-    harmony = HarmonyFilter()
+    MAX_TOOL_ITERATIONS = 3
     request_start = time.time()
 
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
-    try:
-        async with _http_client.stream(
-            "POST",
-            LLM_URL,
-            headers=headers,
-            json={
-                "model": LLM_MODEL,
-                "messages": messages,
-                "stream": True,
-            },
-            timeout=httpx.Timeout(10.0, read=120.0),
-        ) as response:
-            response.raise_for_status()
+    for iteration in range(MAX_TOOL_ITERATIONS + 1):
+        full_text = ""
+        raw_text = ""  # unfiltered LLM output for diagnostics
+        buffer = ""
+        cancelled = False
+        got_first_token = False
+        working_emitted = False
+        harmony = HarmonyFilter()
 
-            async for line in response.aiter_lines():
-                # Check for cancellation
-                if cancel_event.is_set():
-                    cancelled = True
-                    print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
-                    break
+        try:
+            async with _http_client.stream(
+                "POST",
+                LLM_URL,
+                headers=headers,
+                json={
+                    "model": LLM_MODEL,
+                    "messages": messages,
+                    "stream": True,
+                },
+                timeout=httpx.Timeout(10.0, read=120.0),
+            ) as response:
+                response.raise_for_status()
 
-                # Detect tool usage: >2s without content tokens
-                if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
-                    working_emitted = True
-                    print("[LLM] Tools likely running (>2s before first token)")
-                    yield ("working", "")
+                async for line in response.aiter_lines():
+                    # Check for cancellation
+                    if cancel_event.is_set():
+                        cancelled = True
+                        print(f"[LLM] Cancelled after: \"{full_text[:50]}...\"")
+                        break
 
-                if not line.startswith("data: "):
-                    continue
+                    # Detect tool usage: >2s without content tokens
+                    if not got_first_token and not working_emitted and time.time() - request_start > 2.0:
+                        working_emitted = True
+                        print("[LLM] Tools likely running (>2s before first token)")
+                        yield ("working", "")
 
-                data = line[6:]
-                if data == "[DONE]":
-                    break
+                    if not line.startswith("data: "):
+                        continue
 
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
+
+                        if token:
+                            if not got_first_token:
+                                ttft_ms = int((time.time() - request_start) * 1000)
+                                print(f"[LLM] TTFT: {ttft_ms}ms")
+                            got_first_token = True
+                            raw_text += token
+
+                            # Filter Harmony control tokens — only keep 'final' channel
+                            filtered = harmony.feed(token)
+                            if not filtered:
+                                continue
+                            full_text += filtered
+                            buffer += filtered
+                            yield ("token", filtered)
+
+                            # Check for sentence boundaries
+                            while True:
+                                match = SENTENCE_END_RE.search(buffer)
+                                if not match:
+                                    break
+
+                                end_pos = match.end()
+                                sentence = buffer[:end_pos].strip()
+                                buffer = buffer[end_pos:].lstrip()
+
+                                if sentence:
+                                    yield ("sentence", sentence)
+
+                    except json.JSONDecodeError:
+                        continue
+
+        except httpx.HTTPError as e:
+            print(f"[LLM] HTTP error: {e}")
+            cancelled = True
+
+        # Flush any remaining content from the Harmony filter
+        remaining = harmony.flush()
+        if remaining:
+            full_text += remaining
+            buffer += remaining
+
+        if cancelled:
+            # Remove user message from history on cancel
+            if conversation_history and conversation_history[-1]["role"] == "user":
+                conversation_history.pop()
+            remove_last_session_message("user")
+            yield ("cancelled", full_text)
+            return
+
+        # Tool-call iteration: no final channel content, but model requested a tool
+        if harmony.tool_calls and not full_text.strip():
+            if iteration >= MAX_TOOL_ITERATIONS:
+                break
+
+            tool_name, constrain, tool_args_raw = harmony.tool_calls[0]
+            print(f"[Tool] Harmony tool call detected (iteration {iteration + 1}): {tool_name}")
+            print(f"[Tool] Raw args constrain={constrain} chars={len(tool_args_raw or '')}")
+
+            # Parse tool arguments
+            tool_args = {}
+            if constrain == "json":
                 try:
-                    chunk = json.loads(data)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    token = delta.get("content", "")
-
-                    if token:
-                        if not got_first_token:
-                            ttft_ms = int((time.time() - request_start) * 1000)
-                            print(f"[LLM] TTFT: {ttft_ms}ms")
-                        got_first_token = True
-
-                        # Filter Harmony control tokens — only keep 'final' channel
-                        filtered = harmony.feed(token)
-                        if not filtered:
-                            continue
-                        full_text += filtered
-                        buffer += filtered
-                        yield ("token", filtered)
-
-                        # Check for sentence boundaries
-                        while True:
-                            match = SENTENCE_END_RE.search(buffer)
-                            if not match:
-                                break
-
-                            end_pos = match.end()
-                            sentence = buffer[:end_pos].strip()
-                            buffer = buffer[end_pos:].lstrip()
-
-                            if sentence:
-                                yield ("sentence", sentence)
-
+                    parsed = json.loads(tool_args_raw) if tool_args_raw else {}
+                    if isinstance(parsed, dict):
+                        tool_args = parsed
+                    else:
+                        tool_args = {"task": str(parsed)}
                 except json.JSONDecodeError:
-                    continue
+                    tool_args = {"task": tool_args_raw}
+            else:
+                tool_args = {"task": tool_args_raw}
 
-    except httpx.HTTPError as e:
-        print(f"[LLM] HTTP error: {e}")
-        cancelled = True
+            if not working_emitted:
+                yield ("working", "")
 
-    # Flush any remaining content from the Harmony filter
-    remaining = harmony.flush()
-    if remaining:
-        full_text += remaining
-        buffer += remaining
+            # Execute tool, then continue loop with appended context
+            tool_result = await execute_tool(tool_name, tool_args)
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({
+                "role": "user",
+                "content": f"[Tool result from {tool_name}]:\n{tool_result}",
+            })
+            continue
 
-    if cancelled:
-        # Remove user message from history on cancel
-        if conversation_history and conversation_history[-1]["role"] == "user":
-            conversation_history.pop()
-        remove_last_session_message("user")
-        yield ("cancelled", full_text)
-    else:
-        # Emit remaining text
+        # Final response path
         if buffer.strip():
             yield ("sentence", buffer.strip())
 
-        # Track assistant response in history
+        # Track assistant response in history (clean final text only)
         conversation_history.append({"role": "assistant", "content": full_text})
         persist_session_message("assistant", full_text)
         if len(conversation_history) > MAX_HISTORY_MESSAGES:
             conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
         llm_total_ms = int((time.time() - request_start) * 1000)
         print(f"[LLM] → \"{full_text[:80]}...\" ({llm_total_ms}ms)" if len(full_text) > 80 else f"[LLM] → \"{full_text}\" ({llm_total_ms}ms)")
+        # Diagnostic: log raw LLM output when it was filtered to empty or significantly reduced
+        if not full_text and raw_text:
+            print(f"[LLM] ⚠ Response filtered to empty! HarmonyFilter state: harmony={harmony._harmony}, passthrough={harmony._passthrough}, emitting={harmony._emitting}")
+            print(f"[LLM] ⚠ Raw LLM output ({len(raw_text)} chars): \"{raw_text[:300]}\"")
+        elif raw_text and len(full_text) < len(raw_text) * 0.5:
+            print(f"[LLM] ⚠ Significant filtering: {len(raw_text)} raw chars → {len(full_text)} filtered chars")
+            print(f"[LLM] ⚠ Raw LLM output (first 200): \"{raw_text[:200]}\"")
         yield ("done", full_text)
+        return
+
+    # Exhausted tool iterations without a final channel response
+    print(f"[LLM] ⚠ Exhausted {MAX_TOOL_ITERATIONS} tool iterations without final response")
+    fallback = "I tried to look that up but couldn't get a complete answer. Could you try asking differently?"
+    conversation_history.append({"role": "assistant", "content": fallback})
+    persist_session_message("assistant", fallback)
+    if len(conversation_history) > MAX_HISTORY_MESSAGES:
+        conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
+    yield ("sentence", fallback)
+    yield ("done", fallback)
 
 
 def synthesize(text: str) -> tuple[bytes, int]:
@@ -1045,7 +1707,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up Porcupine and HTTP client resources."""
-    global wake_word_model
+    global wake_word_model, _delegate_acp_client
     if wake_word_model is not None:
         try:
             wake_word_model.delete()
@@ -1056,6 +1718,13 @@ async def shutdown_event():
     # Close persistent HTTP client
     await _http_client.aclose()
     print("[HTTP] Client closed.")
+    if _delegate_acp_client is not None:
+        try:
+            await _delegate_acp_client.close()
+            print("[ACP] Client closed.")
+        except Exception:
+            pass
+        _delegate_acp_client = None
 
 
 # Serve React build output (frontend/dist/)
@@ -1453,6 +2122,7 @@ async def websocket_endpoint(ws: WebSocket):
         sentence_count = 0
         total_tts_time = 0
         llm_error = False
+        spoken_structures: set[str] = set()
 
         # If SYSTEM_PROMPT was overridden via env (already contains canvas instructions), skip appending CANVAS_INSTRUCTION
         if canvas_enabled and not os.getenv("SYSTEM_PROMPT"):
@@ -1522,7 +2192,9 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "text": "Speaking..."})
                 try:
                     tts_start = time.time()
-                    tts_text = strip_markdown_for_tts(data)
+                    tts_text = strip_markdown_for_tts(data, spoken_structures)
+                    if not tts_text:
+                        continue
                     audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                     tts_time = time.time() - tts_start
                     total_tts_time += tts_time
@@ -1605,6 +2277,7 @@ async def websocket_endpoint(ws: WebSocket):
         first_sentence_time = None
         sentence_count = 0
         total_tts_time = 0
+        spoken_structures: set[str] = set()
 
         if canvas_enabled and not os.getenv("SYSTEM_PROMPT"):
             effective_prompt = SYSTEM_PROMPT + CANVAS_INSTRUCTION
@@ -1663,7 +2336,9 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "text": "Speaking..."})
                 try:
                     tts_start = time.time()
-                    tts_text = strip_markdown_for_tts(data)
+                    tts_text = strip_markdown_for_tts(data, spoken_structures)
+                    if not tts_text:
+                        continue
                     audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                     tts_time = time.time() - tts_start
                     total_tts_time += tts_time
@@ -1797,6 +2472,7 @@ async def websocket_endpoint(ws: WebSocket):
         llm_start = time.time()
         sentence_count = 0
         total_tts_time = 0
+        spoken_structures: set[str] = set()
 
         # Use meeting system prompt + transcript context
         meeting_messages = [
@@ -1852,7 +2528,9 @@ async def websocket_endpoint(ws: WebSocket):
                     if sentence and not cancel_event.is_set():
                         try:
                             tts_start = time.time()
-                            tts_text = strip_markdown_for_tts(sentence)
+                            tts_text = strip_markdown_for_tts(sentence, spoken_structures)
+                            if not tts_text:
+                                continue
                             audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
                             tts_time = time.time() - tts_start
                             total_tts_time += tts_time
@@ -1866,13 +2544,14 @@ async def websocket_endpoint(ws: WebSocket):
         if buffer.strip() and not cancel_event.is_set():
             try:
                 tts_start = time.time()
-                tts_text = strip_markdown_for_tts(buffer.strip())
-                audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
-                tts_time = time.time() - tts_start
-                total_tts_time += tts_time
-                audio_b64 = base64.b64encode(audio_out).decode()
-                await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": buffer.strip(), "index": sentence_count})
-                sentence_count += 1
+                tts_text = strip_markdown_for_tts(buffer.strip(), spoken_structures)
+                if tts_text:
+                    audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
+                    tts_time = time.time() - tts_start
+                    total_tts_time += tts_time
+                    audio_b64 = base64.b64encode(audio_out).decode()
+                    await ws.send_json({"type": "audio_chunk", "data": audio_b64, "sentence": buffer.strip(), "index": sentence_count})
+                    sentence_count += 1
             except Exception:
                 pass
 
