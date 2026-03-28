@@ -1690,10 +1690,11 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
             yield ("sentence", buffer.strip())
 
         # Track assistant response in history (clean final text only)
-        conversation_history.append({"role": "assistant", "content": full_text})
-        persist_session_message("assistant", full_text)
-        if len(conversation_history) > MAX_HISTORY_MESSAGES:
-            conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
+        async with _history_lock:
+            conversation_history.append({"role": "assistant", "content": full_text})
+            persist_session_message("assistant", full_text)
+            if len(conversation_history) > MAX_HISTORY_MESSAGES:
+                conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
         llm_total_ms = int((time.time() - request_start) * 1000)
         print(f"[LLM] → \"{full_text[:80]}...\" ({llm_total_ms}ms)" if len(full_text) > 80 else f"[LLM] → \"{full_text}\" ({llm_total_ms}ms)")
         # Diagnostic: log raw LLM output when it was filtered to empty or significantly reduced
@@ -1709,10 +1710,11 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
     # Exhausted tool iterations without a final channel response
     print(f"[LLM] ⚠ Exhausted {MAX_TOOL_ITERATIONS} tool iterations without final response")
     fallback = "I tried to look that up but couldn't get a complete answer. Could you try asking differently?"
-    conversation_history.append({"role": "assistant", "content": fallback})
-    persist_session_message("assistant", fallback)
-    if len(conversation_history) > MAX_HISTORY_MESSAGES:
-        conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
+    async with _history_lock:
+        conversation_history.append({"role": "assistant", "content": fallback})
+        persist_session_message("assistant", fallback)
+        if len(conversation_history) > MAX_HISTORY_MESSAGES:
+            conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
     yield ("sentence", fallback)
     yield ("done", fallback)
 
@@ -2632,10 +2634,11 @@ async def websocket_endpoint(ws: WebSocket):
             return
 
         await ws.send_json({"type": "transcript", "role": "user", "text": user_text})
-        conversation_history.append({"role": "user", "content": user_text})
-        persist_session_message("user", user_text)
-        if len(conversation_history) > MAX_HISTORY_MESSAGES:
-            conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
+        async with _history_lock:
+            conversation_history.append({"role": "user", "content": user_text})
+            persist_session_message("user", user_text)
+            if len(conversation_history) > MAX_HISTORY_MESSAGES:
+                conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
 
         # 3. Send to LLM with transcript context
         transcript_context = meeting_session.get_transcript_text(last_n=50)
@@ -2733,10 +2736,11 @@ async def websocket_endpoint(ws: WebSocket):
         # Add response to meeting transcript + display log
         if full_text:
             meeting_session.add_entry("Kismet", full_text)
-            conversation_history.append({"role": "assistant", "content": full_text})
-            persist_session_message("assistant", full_text)
-            if len(conversation_history) > MAX_HISTORY_MESSAGES:
-                conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
+            async with _history_lock:
+                conversation_history.append({"role": "assistant", "content": full_text})
+                persist_session_message("assistant", full_text)
+                if len(conversation_history) > MAX_HISTORY_MESSAGES:
+                    conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
 
         await ws.send_json({
             "type": "stream_end",
