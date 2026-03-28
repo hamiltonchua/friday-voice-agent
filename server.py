@@ -2181,7 +2181,7 @@ async def websocket_endpoint(ws: WebSocket):
         nonlocal client_state, last_activity
         while True:
             await asyncio.sleep(5)  # Check every 5 seconds
-            if client_state == "awake" and not processing_task:
+            if client_state == "awake" and not processing_task and bg_manager.active_count == 0:
                 elapsed = time.time() - last_activity
                 if elapsed > IDLE_TIMEOUT_SEC:
                     client_state = "sleeping"
@@ -2190,6 +2190,8 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "sleep"})
                     except:
                         break
+            elif client_state == "awake" and bg_manager.active_count > 0:
+                print(f"[Delegate] Suppressing idle timeout — {bg_manager.active_count} background tasks active")
 
     # Meeting companion state
     meeting_session = None  # None = normal mode, MeetingSession = meeting mode
