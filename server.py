@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 import wave
 from pathlib import Path
 from typing import AsyncIterator
@@ -84,7 +85,8 @@ SPEAKER_VERIFY = os.getenv("SPEAKER_VERIFY", "auto")  # "true", "false", or "aut
 PUSH_SECRET = os.getenv("PUSH_SECRET", "")
 PUSH_URL = os.getenv("PUSH_URL", "https://prodigy.skunk-shark.ts.net:8765/push")
 
-# Delegation — gpt-oss can delegate tasks to an external AI via `opencode run`
+# Delegation — delegate tasks to an external AI agent via ACP or CLI fallback.
+# Supports any ACP-compatible agent: opencode, hermes, claude, etc.
 DELEGATE_CMD = os.getenv("DELEGATE_CMD", "opencode")
 DELEGATE_MODEL = os.getenv("DELEGATE_MODEL", "opencode/mimo-v2-pro-free")
 DELEGATE_TIMEOUT = int(os.getenv("DELEGATE_TIMEOUT", "120"))  # seconds
@@ -150,8 +152,23 @@ HARMONY_TOOL_DEFS = (
     "\n\n# Tools\n\n"
     "## functions\n\n"
     "namespace functions {\n\n"
+    "// Read the contents of a file on the local filesystem.\n"
+    "// Use this for checking configs, logs, code, or any text file.\n"
+    "// Returns the file contents (truncated to 8000 chars if very large).\n"
+    "type read_file = (_: {\n"
+    "// Absolute path to the file to read\n"
+    "path: string,\n"
+    "}) => any;\n\n"
+    "// List files and directories at a given path.\n"
+    "// Returns names with a trailing / for directories.\n"
+    "type list_directory = (_: {\n"
+    "// Absolute path to the directory to list\n"
+    "path: string,\n"
+    "}) => any;\n\n"
     "// Delegates a task to an external AI assistant for research, up-to-date information,\n"
     "// or complex analysis beyond your local knowledge.\n"
+    "// Use delegate only when the task requires web access, multi-step reasoning,\n"
+    "// or capabilities beyond simple file reading.\n"
     "// The result will be returned to you so you can summarize it for the user.\n"
     "type delegate = (_: {\n"
     "// The complete question or task to delegate, with full context\n"
@@ -174,6 +191,7 @@ wake_word_model = None
 deepfilter_model = None  # MLX DeepFilterNet model (mlx-audio)
 smart_turn_model = None  # SmartTurn endpoint detector (mlx-audio)
 conversation_history = []  # Sliding window of conversation context (sent to LLM each request)
+_history_lock = asyncio.Lock()  # Protect conversation_history from concurrent mutations
 _last_memory_context = ""  # Background-fetched memory context for next turn
 _memory_fetch_task: asyncio.Task | None = None  # In-flight background memory query
 _model_lock = threading.Lock()  # Prevent concurrent MLX/GPU model loads
@@ -841,15 +859,16 @@ class HarmonyFilter:
                         break
                     # Also check for legacy delegation pattern without explicit tool name
                     # e.g. <|channel|>commentary to=delegate
-                    delegate_match = re.search(
-                        r'to=delegate\b.*?<\|message\|>(.*)',
+                    tool_match = re.search(
+                        r'to=(delegate|read_file|list_directory)\b.*?<\|message\|>(.*)',
                         self._buf[:msg_end] + payload, re.DOTALL
                     )
-                    if delegate_match and delegate_match.group(1):
-                        content = _HARMONY_CTRL_RE.sub("", delegate_match.group(1)).strip()
-                        self._current_recipient = "functions.delegate"
+                    if tool_match and tool_match.group(2):
+                        matched_tool = tool_match.group(1)
+                        content = _HARMONY_CTRL_RE.sub("", tool_match.group(2)).strip()
+                        self._current_recipient = f"functions.{matched_tool}"
                         self._current_constrain = "json"
-                        self._tool_calls.append(("functions.delegate", "json", content))
+                        self._tool_calls.append((f"functions.{matched_tool}", "json", content))
                         self._buf = tail[end_idx + end_len:]
                         break
                     # <|message|> present but no tool pattern matched yet — keep buffering
@@ -871,36 +890,37 @@ class HarmonyFilter:
         constrain_match = re.search(r'<\|constrain\|>([^<\s]+)', header)
         constrain = (constrain_match.group(1).strip() if constrain_match else "text")
 
+        _KNOWN_TOOLS = {"delegate", "read_file", "list_directory"}
+
         # Recipient may appear in role position after <|start|>.
         if not recipient:
             start_role_match = re.search(r'<\|start\|>\s*([^\s<]+)', header)
             if start_role_match:
                 candidate = start_role_match.group(1).strip()
-                if candidate in ("delegate", "functions.delegate") or candidate.startswith("functions."):
+                bare = candidate.removeprefix("functions.")
+                if bare in _KNOWN_TOOLS or candidate.startswith("functions."):
                     recipient = candidate
 
         # Some outputs incorrectly place tool name in constrain slot.
-        if not recipient and constrain in ("delegate", "functions.delegate"):
-            recipient = "functions.delegate"
-            constrain = "json"
-        elif not recipient and constrain.startswith("functions."):
-            recipient = constrain
-            constrain = "json"
+        if not recipient:
+            bare_constrain = constrain.removeprefix("functions.")
+            if bare_constrain in _KNOWN_TOOLS or constrain.startswith("functions."):
+                recipient = constrain if constrain.startswith("functions.") else f"functions.{constrain}"
+                constrain = "json"
 
-        # If recipient is still missing, only default to delegate when payload looks like tool args.
+        # If recipient is still missing, try to infer from payload shape.
         if not recipient:
             looks_like_json = raw_content.startswith("{") or raw_content.startswith("[")
-            looks_like_task = '"task"' in raw_content or "'task'" in raw_content
-            if looks_like_json or looks_like_task:
+            if looks_like_json:
                 recipient = "functions.delegate"
                 if constrain == "text":
                     constrain = "json"
             else:
-                # likely commentary preamble, not a tool call
                 return None
 
-        if recipient == "delegate":
-            recipient = "functions.delegate"
+        # Normalize bare tool names to functions.* prefix
+        if not recipient.startswith("functions."):
+            recipient = f"functions.{recipient}"
 
         return recipient, constrain or "text", raw_content
 
@@ -919,15 +939,16 @@ class HarmonyFilter:
                 self._buf = ""
                 return ""
 
-        delegate_match = re.search(
-            r'to=delegate\b.*?<\|message\|>(.*)',
+        tool_match = re.search(
+            r'to=(delegate|read_file|list_directory)\b.*?<\|message\|>(.*)',
             self._buf, re.DOTALL
         )
-        if delegate_match and delegate_match.group(1):
-            content = _HARMONY_CTRL_RE.sub("", delegate_match.group(1)).strip()
-            self._current_recipient = "functions.delegate"
+        if tool_match and tool_match.group(2):
+            matched_tool = tool_match.group(1)
+            content = _HARMONY_CTRL_RE.sub("", tool_match.group(2)).strip()
+            self._current_recipient = f"functions.{matched_tool}"
             self._current_constrain = "json"
-            self._tool_calls.append(("functions.delegate", "json", content))
+            self._tool_calls.append((f"functions.{matched_tool}", "json", content))
             self._buf = ""
             return ""
 
@@ -942,6 +963,73 @@ class HarmonyFilter:
     def tool_calls(self) -> list:
         """Return detected tool calls: [(recipient, constrain_type, content), ...]"""
         return self._tool_calls
+
+
+# ---------------------------------------------------------------------------
+# Background Task Manager
+# ---------------------------------------------------------------------------
+
+class BackgroundTaskManager:
+    """Manages per-connection background delegate tasks for async delegation."""
+
+    def __init__(self, ws: WebSocket):
+        self._ws = ws
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._results: asyncio.Queue = asyncio.Queue()
+        self._metadata: dict[str, dict] = {}
+
+    def start_delegate(self, task_id: str, description: str, coro) -> None:
+        """Start a background delegate task and send task_start message."""
+        task = asyncio.create_task(coro)
+        self._tasks[task_id] = task
+        self._metadata[task_id] = {"description": description}
+
+        # Send task_start message
+        asyncio.get_event_loop().create_task(
+            self._ws.send_json({"type": "task_start", "task_id": task_id, "description": description})
+        )
+
+        # Attach done callback
+        task.add_done_callback(lambda t: self._on_task_done(task_id, t))
+
+    def _on_task_done(self, task_id: str, task: asyncio.Task) -> None:
+        """Handle task completion: put result in queue and send WS message."""
+        description = self._metadata.get(task_id, {}).get("description", "")
+
+        try:
+            result = task.result()
+            # Put result in queue for polling
+            self._results.put_nowait((task_id, description, result))
+            # Send task_complete message
+            asyncio.get_event_loop().create_task(
+                self._ws.send_json({"type": "task_complete", "task_id": task_id})
+            )
+        except asyncio.CancelledError:
+            # Cancelled tasks are silent — no error message
+            pass
+        except Exception as e:
+            # Send task_error message
+            asyncio.get_event_loop().create_task(
+                self._ws.send_json({"type": "task_error", "task_id": task_id, "error": str(e)})
+            )
+
+    def get_pending_result(self) -> tuple[str, str, str] | None:
+        """Non-blocking check for completed task result. Returns (task_id, description, result) or None."""
+        try:
+            return self._results.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    @property
+    def active_count(self) -> int:
+        """Return number of running (not done) tasks."""
+        return sum(1 for task in self._tasks.values() if not task.done())
+
+    def cancel_all(self) -> None:
+        """Cancel all running tasks."""
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
 
 
 async def call_delegated_agent(task: str) -> str:
@@ -1001,15 +1089,36 @@ class OpencodeACPClient:
                     if text:
                         self._updates_by_session.setdefault(session_id, []).append(text)
 
+    # Stderr noise patterns from ACP agents that retry multiple payload
+    # formats — the JSON-RPC error response is already handled by the caller.
+    _STDERR_NOISE_RE = re.compile(
+        r"(Method not found|Background task failed|"
+        r"RequestError\.method_not_found|"
+        r"acp\.exceptions\.RequestError)",
+    )
+
     async def _read_stderr(self):
         assert self._proc and self._proc.stderr
+        squelch_traceback = False
         while True:
             line = await self._proc.stderr.readline()
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
-            if text:
-                print(f"[ACP] {text}")
+            if not text:
+                squelch_traceback = False
+                continue
+            # Suppress known noise: "Method not found" tracebacks from
+            # unsupported ACP methods that we already handle via JSON-RPC.
+            if self._STDERR_NOISE_RE.search(text):
+                squelch_traceback = True
+                continue
+            if squelch_traceback:
+                # Swallow continuation lines of a noisy traceback.
+                if text.startswith((" ", "Traceback", "File ")):
+                    continue
+                squelch_traceback = False
+            print(f"[ACP] {text}")
 
     def _extract_update_text(self, update: object) -> str:
         parts: list[str] = []
@@ -1087,11 +1196,14 @@ class OpencodeACPClient:
             if time.time() < self._failed_until:
                 raise RuntimeError("ACP startup is in cooldown after previous failure")
 
+            # Build args: all ACP agents accept "acp"; --cwd is
+            # opencode-specific — other agents receive cwd via session/new.
+            cmd_name = Path(self._cmd_path).stem.lower()
+            acp_args = [self._cmd_path, "acp"]
+            if cmd_name == "opencode":
+                acp_args += ["--cwd", self._cwd]
             self._proc = await asyncio.create_subprocess_exec(
-                self._cmd_path,
-                "acp",
-                "--cwd",
-                self._cwd,
+                *acp_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1148,28 +1260,30 @@ class OpencodeACPClient:
             session_id = self._session_id
             self._updates_by_session[session_id] = []
 
-            # Best effort model switch. Ignore if not supported by agent.
-            try:
-                set_model_payloads = [
-                    {"sessionId": session_id, "modelId": model},
-                    {"sessionId": session_id, "model": model},
-                ]
-                set_model_error: Exception | None = None
-                for payload in set_model_payloads:
-                    try:
-                        await self._request(
-                            "session/set_model",
-                            payload,
-                            timeout_sec=5.0,
-                        )
-                        set_model_error = None
-                        break
-                    except Exception as e:
-                        set_model_error = e
-                if set_model_error is not None:
-                    raise set_model_error
-            except Exception as e:
-                print(f"[ACP] session/set_model not applied: {e}")
+            # Best effort model switch — only supported by opencode.
+            cmd_name = Path(self._cmd_path).stem.lower()
+            if cmd_name == "opencode":
+                try:
+                    set_model_payloads = [
+                        {"sessionId": session_id, "modelId": model},
+                        {"sessionId": session_id, "model": model},
+                    ]
+                    set_model_error: Exception | None = None
+                    for payload in set_model_payloads:
+                        try:
+                            await self._request(
+                                "session/set_model",
+                                payload,
+                                timeout_sec=5.0,
+                            )
+                            set_model_error = None
+                            break
+                        except Exception as e:
+                            set_model_error = e
+                    if set_model_error is not None:
+                        raise set_model_error
+                except Exception as e:
+                    print(f"[ACP] session/set_model not applied: {e}")
 
             prompt_payloads = [
                 {"sessionId": session_id, "prompt": [{"type": "text", "text": task}]},
@@ -1324,9 +1438,62 @@ def _coerce_delegate_task(raw: object) -> str:
     return str(value).strip()
 
 
+def _execute_read_file(arguments: dict) -> str:
+    """Read a file from the local filesystem. Returns contents truncated to 8000 chars."""
+    path_str = arguments.get("path", "")
+    if not path_str:
+        return "Error: No path provided."
+    target = Path(path_str).resolve()
+    if not target.exists():
+        return f"Error: {target} does not exist."
+    if not target.is_file():
+        return f"Error: {target} is not a file."
+    try:
+        content = target.read_text(errors="replace")
+        if len(content) > 8000:
+            return content[:8000] + f"\n\n[Truncated — file is {len(content)} chars total]"
+        return content
+    except Exception as e:
+        return f"Error reading {target}: {e}"
+
+
+def _execute_list_directory(arguments: dict) -> str:
+    """List files and directories at a given path."""
+    path_str = arguments.get("path", "")
+    if not path_str:
+        return "Error: No path provided."
+    target = Path(path_str).resolve()
+    if not target.exists():
+        return f"Error: {target} does not exist."
+    if not target.is_dir():
+        return f"Error: {target} is not a directory."
+    try:
+        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        lines = []
+        for entry in entries[:200]:
+            name = entry.name + ("/" if entry.is_dir() else "")
+            lines.append(name)
+        result = "\n".join(lines)
+        if len(entries) > 200:
+            result += f"\n\n[Showing 200 of {len(entries)} entries]"
+        return result
+    except PermissionError:
+        return f"Error: Permission denied for {target}"
+    except Exception as e:
+        return f"Error listing {target}: {e}"
+
+
 async def execute_tool(tool_name: str, arguments: dict) -> str:
     """Execute a Harmony tool call and return the result text."""
-    if tool_name == "functions.delegate" or tool_name == "delegate":
+    if tool_name in ("functions.read_file", "read_file"):
+        print(f"[Tool] read_file: {arguments.get('path', '?')}")
+        return _execute_read_file(arguments)
+
+    if tool_name in ("functions.list_directory", "list_directory"):
+        print(f"[Tool] list_directory: {arguments.get('path', '?')}")
+        return _execute_list_directory(arguments)
+
+    if tool_name in ("functions.delegate", "delegate"):
         task = _coerce_delegate_task(arguments)
         preview = task.replace("\n", "\\n")
         if len(preview) > 240:
@@ -1337,9 +1504,9 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
         if not DELEGATE_ENABLED:
             return "Delegation is disabled. Answer based on your own knowledge."
         return await call_delegated_agent(task)
-    else:
-        print(f"[Tool] Unknown tool: {tool_name}")
-        return f"Error: Unknown tool '{tool_name}'. Available tools: delegate"
+
+    print(f"[Tool] Unknown tool: {tool_name}")
+    return f"Error: Unknown tool '{tool_name}'. Available tools: read_file, list_directory, delegate"
 
 
 
@@ -1366,15 +1533,17 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
 
     # Build messages with conversation history (sliding window)
     messages = [{"role": "system", "content": effective_prompt}]
-    messages.extend(conversation_history[-MAX_HISTORY_MESSAGES:])
+    async with _history_lock:
+        messages.extend(conversation_history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
 
     # Track in conversation history + persistent session memory
-    conversation_history.append({"role": "user", "content": user_text})
-    persist_session_message("user", user_text)
-    # Trim history to sliding window
-    if len(conversation_history) > MAX_HISTORY_MESSAGES:
-        conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
+    async with _history_lock:
+        conversation_history.append({"role": "user", "content": user_text})
+        persist_session_message("user", user_text)
+        # Trim history to sliding window
+        if len(conversation_history) > MAX_HISTORY_MESSAGES:
+            conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
 
     MAX_TOOL_ITERATIONS = 3
     request_start = time.time()
@@ -1474,8 +1643,9 @@ async def chat_stream(user_text: str, cancel_event: asyncio.Event, system_prompt
 
         if cancelled:
             # Remove user message from history on cancel
-            if conversation_history and conversation_history[-1]["role"] == "user":
-                conversation_history.pop()
+            async with _history_lock:
+                if conversation_history and conversation_history[-1]["role"] == "user":
+                    conversation_history.pop()
             remove_last_session_message("user")
             yield ("cancelled", full_text)
             return
@@ -1699,7 +1869,8 @@ async def startup_event():
     """Preload all models at server start, not per-connection."""
     global conversation_history
     init_session_db()
-    conversation_history = load_recent_session_messages(MAX_HISTORY_MESSAGES)
+    async with _history_lock:
+        conversation_history = load_recent_session_messages(MAX_HISTORY_MESSAGES)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, preload_models)
 
@@ -2230,15 +2401,17 @@ async def websocket_endpoint(ws: WebSocket):
                 if '<thinking>' in data:
                     data = THINKING_BLOCK_RE.sub("", data).strip()
                     data = re.sub(r'\n{3,}', '\n\n', data)
-                    if conversation_history and conversation_history[-1]["role"] == "assistant":
-                        conversation_history[-1]["content"] = data
+                    async with _history_lock:
+                        if conversation_history and conversation_history[-1]["role"] == "assistant":
+                            conversation_history[-1]["content"] = data
 
                 # Extract and push canvas blocks if enabled
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
                     # Update display log with cleaned text (no canvas markup)
-                    if conversation_history and conversation_history[-1]["role"] == "assistant":
-                        conversation_history[-1]["content"] = cleaned_text
+                    async with _history_lock:
+                        if conversation_history and conversation_history[-1]["role"] == "assistant":
+                            conversation_history[-1]["content"] = cleaned_text
                     if canvas_blocks:
                         asyncio.create_task(push_canvas(canvas_blocks, loop))
                         await ws.send_json({"type": "canvas_pushed", "count": len(canvas_blocks)})
@@ -2368,14 +2541,16 @@ async def websocket_endpoint(ws: WebSocket):
                 if '<thinking>' in data:
                     data = THINKING_BLOCK_RE.sub("", data).strip()
                     data = re.sub(r'\n{3,}', '\n\n', data)
-                    if conversation_history and conversation_history[-1]["role"] == "assistant":
-                        conversation_history[-1]["content"] = data
+                    async with _history_lock:
+                        if conversation_history and conversation_history[-1]["role"] == "assistant":
+                            conversation_history[-1]["content"] = data
 
                 if canvas_enabled and '<canvas' in data:
                     cleaned_text, canvas_blocks = extract_canvas_blocks(data)
                     # Update display log with cleaned text (no canvas markup)
-                    if conversation_history and conversation_history[-1]["role"] == "assistant":
-                        conversation_history[-1]["content"] = cleaned_text
+                    async with _history_lock:
+                        if conversation_history and conversation_history[-1]["role"] == "assistant":
+                            conversation_history[-1]["content"] = cleaned_text
                     if canvas_blocks:
                         asyncio.create_task(push_canvas(canvas_blocks, loop))
                         await ws.send_json({"type": "canvas_pushed", "count": len(canvas_blocks)})
@@ -2779,7 +2954,8 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif msg["type"] == "clear":
                 cancel_event.set()
-                conversation_history.clear()  # Clear conversation history
+                async with _history_lock:
+                    conversation_history.clear()  # Clear conversation history
                 clear_session_memory()
                 if meeting_session:
                     meeting_session.clear()
