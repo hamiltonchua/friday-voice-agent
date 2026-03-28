@@ -2770,6 +2770,113 @@ async def websocket_endpoint(ws: WebSocket):
             "sentences": sentence_count,
         })
 
+    async def deliver_result(task_id: str, description: str, result: str):
+        """Deliver a completed background delegate result via LLM summarization."""
+        nonlocal skip_tts
+        if not (result or "").strip():
+            await ws.send_json({
+                "type": "transcript",
+                "role": "system",
+                "text": f"Background task '{description[:60]}' completed with no output.",
+            })
+            return
+
+        print(f"[Delegate] Delivering result for {task_id}: {description[:60]}")
+        await ws.send_json({
+            "type": "transcript",
+            "role": "system",
+            "text": f"Background task completed: {description[:80]}",
+        })
+        await ws.send_json({"type": "stream_start"})
+
+        wrapper_text = (
+            f"[Background task completed]\n"
+            f"You previously started a background task for the user: '{description}'\n\n"
+            f"Here is the result:\n{result}\n\n"
+            "Briefly summarize what was accomplished or found. Keep it concise for spoken delivery."
+        )
+
+        sentence_count = 0
+        total_tts_time = 0.0
+        full_text = ""
+        llm_start = time.time()
+        spoken_structures: set[str] = set()
+
+        # Stream LLM summarization — pass bg_manager=None to prevent recursive delegates
+        async for event_type, data in chat_stream(wrapper_text, cancel_event, bg_manager=None):
+            if cancel_event.is_set() and event_type not in ("cancelled", "done"):
+                break
+
+            if event_type == "token":
+                await ws.send_json({"type": "token", "text": data})
+
+            elif event_type == "sentence":
+                full_text += data + " "
+                if skip_tts:
+                    sentence_count += 1
+                    continue
+                try:
+                    tts_start = time.time()
+                    tts_text = strip_markdown_for_tts(data, spoken_structures)
+                    if not tts_text:
+                        continue
+                    audio_out, sr = await loop.run_in_executor(None, synthesize, tts_text)
+                    tts_time = time.time() - tts_start
+                    total_tts_time += tts_time
+                    audio_b64 = base64.b64encode(audio_out).decode()
+                    await ws.send_json({
+                        "type": "audio_chunk",
+                        "data": audio_b64,
+                        "sentence": data,
+                        "index": sentence_count,
+                    })
+                    sentence_count += 1
+                except Exception:
+                    pass
+
+            elif event_type == "done":
+                full_text = data
+                llm_time = time.time() - llm_start
+                await ws.send_json({
+                    "type": "stream_end",
+                    "text": full_text,
+                    "times": {
+                        "llm": round(llm_time, 2),
+                        "tts": round(total_tts_time, 2),
+                    },
+                    "sentences": sentence_count,
+                })
+                async with _history_lock:
+                    conversation_history.append({"role": "assistant", "content": full_text})
+                    persist_session_message("assistant", full_text)
+                    if len(conversation_history) > MAX_HISTORY_MESSAGES:
+                        conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
+                print(f"[Delegate] Result delivery complete for {task_id}")
+                break
+
+            elif event_type == "cancelled":
+                break
+
+    async def deliver_delegate_results():
+        """Background task: polls for completed delegate results and delivers them when idle."""
+        while True:
+            try:
+                await asyncio.sleep(1.5)
+                pending = bg_manager.get_pending_result()
+                if pending is None:
+                    continue
+                task_id, description, result = pending
+                if processing_task and not processing_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(processing_task), timeout=60.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                await deliver_result(task_id, description, result)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[Delegate] Error in deliver_delegate_results: {e}")
+
     async def listen_for_pushes():
         """
         Background task: picks up messages from POST /push and delivers them to
@@ -2801,6 +2908,7 @@ async def websocket_endpoint(ws: WebSocket):
     if WAKE_WORD_ENABLED:
         idle_check_task = asyncio.create_task(check_idle())
     push_listener_task = asyncio.create_task(listen_for_pushes())
+    delegate_delivery_task = asyncio.create_task(deliver_delegate_results())
 
     try:
         while True:
@@ -2999,6 +3107,7 @@ async def websocket_endpoint(ws: WebSocket):
         if idle_check_task:
             idle_check_task.cancel()
         push_listener_task.cancel()
+        delegate_delivery_task.cancel()
         print("[WS] Client disconnected")
 
 
