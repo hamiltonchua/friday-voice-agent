@@ -8,7 +8,7 @@ import { useVAD } from './hooks/useVAD'
 import { useManualRecording, float32ToBase64 } from './hooks/useManualRecording'
 import { useAudioLevel } from './hooks/useAudioLevel'
 import { SAMPLE_RATE } from './constants'
-import type { ChatMessage, MeetingEntry, ClientState, TimingInfo } from './types'
+import type { ChatMessage, MeetingEntry, ClientState, TimingInfo, BackgroundTask } from './types'
 import { Header } from './components/Header'
 import { ChatDisplay } from './components/ChatDisplay'
 import { Controls } from './components/Controls'
@@ -69,6 +69,9 @@ export default function App() {
   const meetingModeRef = useRef(false)
   const [meetingEntries, setMeetingEntries] = useState<MeetingEntry[]>([])
   const meetingCommandCaptureRef = useRef(false)
+
+  // ---- Background tasks ----
+  const [activeTasks, setActiveTasks] = useState<BackgroundTask[]>([])
 
   // ---- Mic state for UI ----
   const [micState, setMicState] = useState<'idle' | 'recording' | 'vad-active' | 'sleeping'>('idle')
@@ -518,6 +521,36 @@ export default function App() {
 
     } else if (type === 'canvas_pushed') {
       // Canvas content was pushed to a2ui — no action needed
+
+    } else if (type === 'task_start') {
+      const newTask: BackgroundTask = {
+        id: msg.task_id as string,
+        description: msg.description as string,
+        startTime: Date.now(),
+        status: 'running',
+      }
+      setActiveTasks(prev => [...prev, newTask])
+
+    } else if (type === 'task_complete') {
+      const taskId = msg.task_id as string
+      setActiveTasks(prev => prev.map(t =>
+        t.id === taskId ? { ...t, status: 'complete' } : t
+      ))
+      setTimeout(() => {
+        setActiveTasks(prev => prev.filter(t => t.id !== taskId))
+      }, 3000)
+
+    } else if (type === 'task_error') {
+      const taskId = msg.task_id as string
+      const errorMsg = msg.error as string
+      const description = msg.description as string
+      setActiveTasks(prev => prev.map(t =>
+        t.id === taskId ? { ...t, status: 'error', error: errorMsg } : t
+      ))
+      toast.error(`Task failed: ${description ?? taskId} — ${errorMsg}`)
+      setTimeout(() => {
+        setActiveTasks(prev => prev.filter(t => t.id !== taskId))
+      }, 5000)
     }
   }, [
     enableWakeWordMode, updateStatusForMode, handleMeetingWake, handleWake, handleSleep,
@@ -727,6 +760,7 @@ export default function App() {
         verifyEnabled={verifyEnabled}
         canvasEnabled={canvasEnabled}
         noiseSuppressionEnabled={noiseSuppressionEnabled}
+        activeTasks={activeTasks}
         onEnroll={handleEnrollStart}
         onVerifyToggle={handleVerifyToggle}
         onMeetingToggle={() => meetingMode ? exitMeetingMode() : enterMeetingMode()}

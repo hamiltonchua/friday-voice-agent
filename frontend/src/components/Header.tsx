@@ -1,5 +1,6 @@
 // frontend/src/components/Header.tsx
 import * as React from 'react'
+import type { BackgroundTask } from '../types'
 
 interface HeaderProps {
   statusText: string
@@ -10,12 +11,13 @@ interface HeaderProps {
   verifyEnabled: boolean
   canvasEnabled: boolean
   noiseSuppressionEnabled: boolean
+  activeTasks?: BackgroundTask[]
   onEnroll: () => void
   onVerifyToggle: () => void
   onMeetingToggle: () => void
 }
 
-export function Header({ statusText, statusClass, connectionDot, meetingMode, enrolled, verifyEnabled, canvasEnabled, noiseSuppressionEnabled, onEnroll, onVerifyToggle, onMeetingToggle }: HeaderProps) {
+export function Header({ statusText, statusClass, connectionDot, meetingMode, enrolled, verifyEnabled, canvasEnabled, noiseSuppressionEnabled, activeTasks: _activeTasks, onEnroll, onVerifyToggle, onMeetingToggle }: HeaderProps) {
   // Mobile-only top bar — hidden on desktop (md+)
   return (
     <header

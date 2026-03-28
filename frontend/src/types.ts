@@ -36,3 +36,11 @@ export interface TimingInfo {
   tts: number
   first_sentence?: number
 }
+
+export interface BackgroundTask {
+  id: string
+  description: string
+  startTime: number
+  status: 'running' | 'complete' | 'error'
+  error?: string
+}
