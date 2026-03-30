@@ -174,6 +174,23 @@ HARMONY_TOOL_DEFS = (
     "// The complete question or task to delegate, with full context\n"
     "task: string,\n"
     "}) => any;\n\n"
+    "// Search your long-term memory for relevant information.\n"
+    "// Use when the user references something from the past, asks 'do you remember',\n"
+    "// or when context from previous conversations would help.\n"
+    "type search_memory = (_: {\n"
+    "// Natural language search query\n"
+    "query: string,\n"
+    "}) => any;\n\n"
+    "// Save an important fact, preference, or piece of information to long-term memory.\n"
+    "// Use when the user shares something worth remembering for future conversations.\n"
+    "type save_memory = (_: {\n"
+    "// Short title for the memory\n"
+    "title: string,\n"
+    "// The full content to remember\n"
+    "content: string,\n"
+    "// Optional comma-separated keywords for retrieval\n"
+    "keywords?: string,\n"
+    "}) => any;\n\n"
     "} // namespace functions"
 )
 
@@ -1135,7 +1152,7 @@ class OpencodeACPClient:
                     walk(item)
 
         walk(update)
-        return "".join(parts).strip()
+        return _sanitize_delegate_text("".join(parts).strip())
 
     def _extract_result_text(self, result: object) -> str:
         parts: list[str] = []
@@ -1158,7 +1175,7 @@ class OpencodeACPClient:
                     walk(item)
 
         walk(result)
-        return "".join(parts).strip()
+        return _sanitize_delegate_text("".join(parts).strip())
 
     async def _request(self, method: str, params: dict, timeout_sec: float) -> dict:
         if not self._proc or not self._proc.stdin:
@@ -1435,6 +1452,46 @@ def _coerce_delegate_task(raw: object) -> str:
     return str(value).strip()
 
 
+def _sanitize_delegate_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text
+    # --- Phase 1: strip full Harmony message blocks BEFORE individual tokens ---
+    # Full Harmony block: <|start|>assistant<|channel|>commentary ... (entire trailing block)
+    cleaned = re.sub(
+        r'<\|start\|>assistant<\|channel\|>commentary.*',
+        '', cleaned, flags=re.DOTALL,
+    )
+    # Full Harmony block: <|start|>assistant<|channel|>... any channel (tool calls, etc.)
+    cleaned = re.sub(
+        r'<\|start\|>assistant<\|channel\|>\w+.*?(?=<\|start\|>|\Z)',
+        '', cleaned, flags=re.DOTALL,
+    )
+    # Commentary routing lines that reference tool functions
+    cleaned = re.sub(r'<\|channel\|>\w+\s+to=[^\n]+', '', cleaned)
+    # --- Phase 2: strip individual control tokens ---
+    cleaned = re.sub(r'<\|(?:start|end|return|call|channel|constrain|message)\|>', '', cleaned)
+    # --- Phase 3: strip residual patterns left after token removal ---
+    # Bare "assistant" at start of a line followed by "commentary to=..." or JSON payloads
+    cleaned = re.sub(r'\bassistant\s*commentary\s+to=\S+.*', '', cleaned, flags=re.DOTALL)
+    # Bare "commentary to=..." without preceding tokens
+    cleaned = re.sub(r'\bcommentary\s+to=\S+[^\n]*', '', cleaned)
+    # Residual JSON payloads from tool calls (e.g. {"query":"..."} on its own line)
+    cleaned = re.sub(r'^\s*\{\"(?:query|task|action|text|command)\":[^\n]*$', '', cleaned, flags=re.MULTILINE)
+    # Bare constrain hints like "json" left after token stripping
+    cleaned = re.sub(r'^\s*json\s*$', '', cleaned, flags=re.MULTILINE)
+    # --- Phase 4: strip system/memory blocks ---
+    # [System note: ...] block — strip everything from marker to end (greedy, these are always trailing)
+    cleaned = re.sub(r'\[System note:.*', '', cleaned, flags=re.DOTALL)
+    # Honcho Memory header and everything after it
+    cleaned = re.sub(r'# Honcho Memory \(persistent cross-session context\).*', '', cleaned, flags=re.DOTALL)
+    # Catch partial Honcho blocks that start with known section headers
+    cleaned = re.sub(r'## (?:User representation|AI peer representation|Continuity synthesis|Explicit Observations|Deductive Observations|Inductive Observations).*', '', cleaned, flags=re.DOTALL)
+    # --- Phase 5: collapse whitespace ---
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
 def _execute_read_file(arguments: dict) -> str:
     """Read a file from the local filesystem. Returns contents truncated to 8000 chars."""
     path_str = arguments.get("path", "")
@@ -1480,6 +1537,93 @@ def _execute_list_directory(arguments: dict) -> str:
         return f"Error listing {target}: {e}"
 
 
+async def _execute_search_memory(arguments: dict) -> str:
+    """Active search_memory tool — query Forgetful for relevant memories."""
+    query = arguments.get("query", "").strip()
+    if not query:
+        return "Error: No query provided for search_memory."
+    if not FORGETFUL_ENABLED or not _forgetful_client:
+        print("[MemoryTool] search_memory called but Forgetful is disabled")
+        return "Memory search is currently unavailable."
+    print(f"[MemoryTool] search_memory query='{query[:120]}'")
+    t0 = time.time()
+    try:
+        resp = await _forgetful_client.post("/api/v1/memories/search", json={
+            "query": query,
+            "query_context": "Voice agent active memory search",
+            "k": FORGETFUL_MAX_MEMORIES,
+            "include_links": False,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        memories = data if isinstance(data, list) else data.get("memories", data.get("results", []))
+        elapsed = int((time.time() - t0) * 1000)
+        if not memories:
+            print(f"[MemoryTool] search_memory no_results elapsed_ms={elapsed}")
+            return "No relevant memories found."
+        lines = []
+        for mem in memories:
+            title = mem.get("title", "")
+            content = mem.get("content", "")
+            if len(content) > FORGETFUL_MAX_CONTENT_CHARS:
+                content = content[:FORGETFUL_MAX_CONTENT_CHARS] + "…"
+            lines.append(f"- {title}: {content}")
+        print(f"[MemoryTool] search_memory success results={len(memories)} elapsed_ms={elapsed}")
+        return "\n".join(lines)
+    except Exception as e:
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"[MemoryTool] search_memory failed error={e} elapsed_ms={elapsed}")
+        return f"Memory search failed: {e}"
+
+
+async def _execute_save_memory(arguments: dict) -> str:
+    """Active save_memory tool — save a memory to Forgetful."""
+    title = arguments.get("title", "").strip()
+    content = arguments.get("content", "").strip()
+    if not title or not content:
+        return "Error: Both title and content are required for save_memory."
+    if not FORGETFUL_ENABLED or not _forgetful_client:
+        print("[MemoryTool] save_memory called but Forgetful is disabled")
+        return "Memory save is currently unavailable."
+    # keywords/tags can arrive as comma-separated string or list
+    keywords_raw = arguments.get("keywords", "")
+    if isinstance(keywords_raw, list):
+        keywords = [k.strip() for k in keywords_raw if isinstance(k, str) and k.strip()]
+    elif isinstance(keywords_raw, str) and keywords_raw:
+        keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    else:
+        keywords = []
+    tags_raw = arguments.get("tags", "")
+    if isinstance(tags_raw, list):
+        tags = [t.strip() for t in tags_raw if isinstance(t, str) and t.strip()]
+    elif isinstance(tags_raw, str) and tags_raw:
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    else:
+        tags = ["voice-agent"]
+    context = arguments.get("context", "kismet-voice-agent")
+    print(f"[MemoryTool] save_memory title='{title[:80]}' keywords={len(keywords)} tags={tags}")
+    t0 = time.time()
+    try:
+        payload = {
+            "title": title,
+            "content": content,
+            "context": context,
+            "keywords": keywords,
+            "tags": tags,
+        }
+        resp = await _forgetful_client.post("/api/v1/memories", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        mem_id = data.get("id", "?")
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"[MemoryTool] save_memory success id={mem_id} elapsed_ms={elapsed}")
+        return f"Memory saved: '{title}'"
+    except Exception as e:
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"[MemoryTool] save_memory failed error={e} elapsed_ms={elapsed}")
+        return f"Memory save failed: {e}"
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict,
@@ -1517,8 +1661,16 @@ async def execute_tool(
             )
         return await call_delegated_agent(task)
 
+    if tool_name in ("functions.search_memory", "search_memory"):
+        print(f"[Action] Memory tool selected: search_memory")
+        return await _execute_search_memory(arguments)
+
+    if tool_name in ("functions.save_memory", "save_memory"):
+        print(f"[Action] Memory tool selected: save_memory")
+        return await _execute_save_memory(arguments)
+
     print(f"[Tool] Unknown tool: {tool_name}")
-    return f"Error: Unknown tool '{tool_name}'. Available tools: read_file, list_directory, delegate"
+    return f"Error: Unknown tool '{tool_name}'. Available tools: read_file, list_directory, delegate, search_memory, save_memory"
 
 
 

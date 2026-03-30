@@ -184,9 +184,9 @@ Create a `.env` file and fill in your values:
 | `PUSH_SECRET` | — | Bearer token required by `/push` and `/webhook/*` |
 | `PUSH_URL` | `https://prodigy.skunk-shark.ts.net:8765/push` | Public push endpoint URL used by delegated tools |
 | `DELEGATE_ENABLED` | `true` | Enable external delegation tool |
-| `DELEGATE_USE_ACP` | `true` | Prefer persistent `opencode acp` transport (falls back to `opencode run` on error) |
-| `DELEGATE_CMD` | `opencode` | Delegate CLI command |
-| `DELEGATE_MODEL` | `opencode/mimo-v2-pro-free` | Model passed to the delegate CLI |
+| `DELEGATE_USE_ACP` | `true` | Prefer persistent ACP transport (falls back to CLI `run` on error) |
+| `DELEGATE_CMD` | `opencode` | ACP-compatible agent CLI (`opencode`, `hermes`, `claude`, etc.) |
+| `DELEGATE_MODEL` | `opencode/mimo-v2-pro-free` | Model passed to the delegate agent (e.g. `openrouter/nous/hermes-3-llama-3.1-70b` for Hermes) |
 | `DELEGATE_TIMEOUT` | `120` | Delegate timeout in seconds |
 
 ### Authentication

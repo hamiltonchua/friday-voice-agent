@@ -1,5 +1,5 @@
 // frontend/src/components/ChatInput.tsx
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { SendHorizontal } from 'lucide-react'
 
 interface ChatInputProps {
@@ -10,6 +10,12 @@ interface ChatInputProps {
 export function ChatInput({ onSend, disabled }: ChatInputProps) {
   const [text, setText] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    if (!disabled) {
+      inputRef.current?.focus()
+    }
+  }, [disabled])
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim()
