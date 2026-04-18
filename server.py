@@ -1238,7 +1238,7 @@ class HarmonyFilter:
             if cut > 0:
                 out = self._buf[:cut]
                 self._buf = self._buf[cut:]
-                return out
+                return _HARMONY_CTRL_RE.sub("", out)
             return ""
 
         # Keep a small tail to catch split markers across chunks.
@@ -1247,7 +1247,7 @@ class HarmonyFilter:
             return ""
         out = self._buf[:-keep_tail]
         self._buf = self._buf[-keep_tail:]
-        return out
+        return _HARMONY_CTRL_RE.sub("", out)
 
     def flush(self) -> str:
         """Flush remaining buffer at end of stream."""
