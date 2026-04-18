@@ -1986,8 +1986,7 @@ async def execute_tool(
             return (
                 f"Task '{description[:80]}' has been delegated to a background agent "
                 f"(task {task_id}). It will run asynchronously. "
-                f"Briefly acknowledge to the user that you are working on this in the "
-                f"background and they can continue talking to you."
+                f"Briefly tell the user it's being worked on."
             )
         return await call_delegated_agent(task)
 
