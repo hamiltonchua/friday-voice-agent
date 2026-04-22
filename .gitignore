@@ -24,3 +24,6 @@ voices/*_embedding.npy
 # WebAuthn credentials
 auth_credentials.json
 *.bak
+
+# Git worktrees
+.worktrees/
