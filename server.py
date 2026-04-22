@@ -111,6 +111,15 @@ VOICE_OUTPUT_RULES = (
     "- If listing multiple items, speak them naturally in sentence form."
 )
 
+VOICE_LATENCY_RULES = (
+    "You are in a real-time voice conversation. The user can only hear you, not see you.\n"
+    "If you need to use a tool, search memory, or do anything that takes more than a moment, "
+    "ALWAYS say a brief acknowledgment out loud FIRST — e.g. 'Let me check that', "
+    "'One moment', 'Looking that up now', 'Give me a second'.\n"
+    "Keep acknowledgments under 10 words. Do not use markdown, bullet points, or emojis.\n"
+    "Never stay completely silent for more than a few seconds — the user will think the connection broke."
+)
+
 
 MEETING_SYSTEM_PROMPT = os.getenv("MEETING_SYSTEM_PROMPT", (
     "You are Friday, a local voice assistant helping during a meeting. "
@@ -1055,7 +1064,7 @@ class HarmonyFilter:
         constrain_match = re.search(r'<\|constrain\|>([^<\s]+)', header)
         constrain = (constrain_match.group(1).strip() if constrain_match else "text")
 
-        _KNOWN_TOOLS = {"delegate", "read_file", "list_directory", "search_memory", "save_memory"}
+        _KNOWN_TOOLS = {"delegate", "search_memory", "save_memory"}
 
         # Recipient may appear in role position after <|start|>.
         if not recipient:
@@ -1927,14 +1936,6 @@ async def execute_tool(
     bg_manager: BackgroundTaskManager | None = None,
 ) -> str:
     """Execute a Harmony tool call and return the result text."""
-    if tool_name in ("functions.read_file", "read_file"):
-        print(f"[Tool] read_file: {arguments.get('path', '?')}")
-        return _execute_read_file(arguments)
-
-    if tool_name in ("functions.list_directory", "list_directory"):
-        print(f"[Tool] list_directory: {arguments.get('path', '?')}")
-        return _execute_list_directory(arguments)
-
     if tool_name in ("functions.delegate", "delegate"):
         task = _coerce_delegate_task(arguments)
         preview = task.replace("\n", "\\n")
@@ -1966,7 +1967,7 @@ async def execute_tool(
         return await _execute_save_memory(arguments)
 
     print(f"[Tool] Unknown tool: {tool_name}")
-    return f"Error: Unknown tool '{tool_name}'. Available tools: read_file, list_directory, delegate, search_memory, save_memory"
+    return f"Error: Unknown tool '{tool_name}'. Available tools: delegate, search_memory, save_memory"
 
 
 
